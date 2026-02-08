@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 
 from admin_api import router as admin_router
 from database import init_db, get_db, AdminUser, Document
