@@ -1,26 +1,24 @@
 # main.py
+from __future__ import annotations
+
+import os
+import re
+import uuid
+import shutil
+from datetime import datetime
+from typing import List, Optional
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-from typing import List, Optional, Any, Dict
-from pydantic import BaseModel
-from datetime import datetime
-import os
-import uuid
-import shutil
-from dotenv import load_dotenv
 from passlib.context import CryptContext
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
-# استيراد المكونات المحلية للمشروع
 from admin_api import router as admin_router
-from database import (
-    init_db,
-    get_db,
-    SystemSettings,
-    AdminUser,
-    Document,
-)
+from database import init_db, get_db, AdminUser, Document
 
 from rag_system import RAGSystem
 from llm_service import LLMService
@@ -28,12 +26,12 @@ from document_processor import DocumentProcessor
 
 load_dotenv()
 
-app = FastAPI(title="PSU Chatbot Backend API", version="1.4.0")
+app = FastAPI(title="PSU Chatbot Backend API", version="1.4.3")
 
-# تضمين راوتر الإدارة
+# Admin router (documents list/delete/auth ...)
 app.include_router(admin_router)
 
-# إعدادات CORS (بدون كوكيز/credentials)
+# CORS
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -45,26 +43,14 @@ app.add_middleware(
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
-# تهيئة الخدمات
+# Services
 rag_system = RAGSystem()
 llm_service = LLMService()
 doc_processor = DocumentProcessor(rag_system)
 
 # =========================================================
-# Ensure SystemSettings + Default Admin
+# DB init + Default Admin
 # =========================================================
-def ensure_system_settings():
-    db = next(get_db())
-    try:
-        s = db.query(SystemSettings).first()
-        if not s:
-            db.add(SystemSettings())
-            db.commit()
-            print("✅ SystemSettings created.")
-    finally:
-        db.close()
-
-
 def create_default_admin():
     db = next(get_db())
     admin_username = os.getenv("ADMIN_USERNAME", "admin").strip()
@@ -80,10 +66,8 @@ def create_default_admin():
     finally:
         db.close()
 
-
-# init
+# init (✅ migration صار داخل database.init_db() خلاص)
 init_db()
-ensure_system_settings()
 create_default_admin()
 
 # =========================================================
@@ -92,13 +76,10 @@ create_default_admin()
 class MessageCreate(BaseModel):
     content: str
 
-
 class AttachmentOut(BaseModel):
-    id: int
     name: str
     url: str
     mime: Optional[str] = None
-
 
 class MessageResponse(BaseModel):
     id: int
@@ -106,8 +87,7 @@ class MessageResponse(BaseModel):
     sender: str
     timestamp: datetime
     sources: List[str] = []
-    attachments: List[AttachmentOut] = []  # ✅ جديد
-
+    attachments: List[AttachmentOut] = []
 
 # =========================================================
 # Helpers
@@ -133,79 +113,70 @@ def _guess_mime(filename: str) -> str:
     return "application/octet-stream"
 
 
+_AR_STOP = {
+    "من", "في", "على", "الى", "إلى", "عن", "مع", "و", "او", "أو", "هذا", "هذه",
+    "عطني", "ابغى", "أبغى", "ارسل", "أرسل", "نموذج", "ملف", "تحميل", "رابط",
+    "لو", "ليه", "وش", "ايش", "وشو", "كيف", "ممكن", "فضلا", "فضلاً"
+}
+
+
+def _normalize_ar(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
+    s = s.replace("ة", "ه").replace("ى", "ي")
+    return s
+
+
+def _extract_keywords(query: str) -> List[str]:
+    q = _normalize_ar(query)
+    tokens = re.findall(r"[a-z0-9]+|[\u0600-\u06FF]+", q)
+    tokens = [t for t in tokens if len(t) >= 2 and t not in _AR_STOP]
+    return tokens[:6]
+
+
 def _find_best_document(db: Session, query: str) -> Optional[Document]:
-    """
-    بحث بسيط وآمن عن أقرب ملف في جدول documents بالاسم.
-    """
     q = (query or "").strip()
     if not q:
         return None
 
-    # بحث contains
-    candidates = (
+    q_norm = _normalize_ar(q)
+
+    if any(ext in q_norm for ext in [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".pptx", ".ppt"]):
+        doc = (
+            db.query(Document)
+            .filter(Document.name.ilike(f"%{q}%"))
+            .order_by(Document.upload_date.desc())
+            .first()
+        )
+        if doc:
+            return doc
+
+    keys = _extract_keywords(q)
+    if not keys:
+        short = q[:20]
+        return (
+            db.query(Document)
+            .filter(Document.name.ilike(f"%{short}%"))
+            .order_by(Document.upload_date.desc())
+            .first()
+        )
+
+    conditions = [Document.name.ilike(f"%{k}%") for k in keys]
+    return (
         db.query(Document)
-        .filter(Document.name.contains(q))
+        .filter(or_(*conditions))
         .order_by(Document.upload_date.desc())
-        .limit(10)
-        .all()
+        .first()
     )
 
-    if candidates:
-        return candidates[0]
-
-    # fallback: جرّب كلمات منفصلة (أكثر مرونة)
-    words = [w.strip() for w in q.split() if w.strip()]
-    for w in words[:3]:
-        candidates = (
-            db.query(Document)
-            .filter(Document.name.contains(w))
-            .order_by(Document.upload_date.desc())
-            .limit(10)
-            .all()
-        )
-        if candidates:
-            return candidates[0]
-
-    return None
-
 
 # =========================================================
-# Health / status
+# Download endpoint (✅ FIXED: use public_id)
 # =========================================================
-@app.get("/api/health")
-async def health_check():
-    openai_key = os.getenv("OPENAI_API_KEY")
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    return {
-        "status": "ok",
-        "openai_available": bool(openai_key),
-        "gemini_available": bool(gemini_key),
-        "vector_store_ready": True,
-        "refiner_provider": os.getenv("REFINER_PROVIDER", "gemini"),
-        "refine_model": os.getenv("REFINE_MODEL", "gemini-1.5-flash"),
-        "chat_model": os.getenv("CHAT_MODEL", "gpt-4o-mini"),
-    }
-
-
-@app.get("/api/admin/llm-status")
-async def llm_status():
-    return {
-        "llm_available": llm_service.is_available(),
-        "provider": "OpenAI",
-        "model_name": os.getenv("CHAT_MODEL", "gpt-4o-mini"),
-        "api_key_set": bool((os.getenv("OPENAI_API_KEY") or "").strip()),
-        "refiner_provider": os.getenv("REFINER_PROVIDER", "gemini"),
-        "refine_model": os.getenv("REFINE_MODEL", "gemini-1.5-flash"),
-        "gemini_key_set": bool((os.getenv("GEMINI_API_KEY") or "").strip()),
-    }
-
-
-# =========================================================
-# Download endpoint (new)
-# =========================================================
-@app.get("/api/files/{doc_id}")
-def download_file(doc_id: int, db: Session = Depends(get_db)):
-    doc = db.query(Document).filter(Document.id == doc_id).first()
+@app.get("/api/files/{public_id}")
+def download_file(public_id: str, db: Session = Depends(get_db)):
+    # مهم: هنا نعتمد على ORM لأن العمود صار موجود بعد migration
+    doc = db.query(Document).filter(Document.public_id == public_id).first()
     if not doc:
         raise HTTPException(404, "الملف غير موجود.")
 
@@ -215,13 +186,7 @@ def download_file(doc_id: int, db: Session = Depends(get_db)):
 
     filename = doc.name or os.path.basename(path)
     media_type = _guess_mime(filename)
-
-    # FileResponse يرسل الملف للتنزيل مباشرة
-    return FileResponse(
-        path=path,
-        media_type=media_type,
-        filename=filename,
-    )
+    return FileResponse(path=path, media_type=media_type, filename=filename)
 
 
 # =========================================================
@@ -236,9 +201,9 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
     if existing_doc:
         return {"status": "exists", "message": f"الملف '{file.filename}' موجود مسبقًا ولم يتم الحفظ."}
 
-    file_id = str(uuid.uuid4())
+    file_uuid = uuid.uuid4().hex
     safe_name = file.filename.replace("\\", "_").replace("/", "_")
-    file_path = os.path.join(upload_dir, f"{file_id}_{safe_name}")
+    file_path = os.path.join(upload_dir, f"{file_uuid}_{safe_name}")
 
     try:
         with open(file_path, "wb") as buffer:
@@ -248,12 +213,13 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
         size_str = f"{round(file_size_bytes / (1024 * 1024), 2)} MB"
 
         new_doc = Document(
+            public_id=uuid.uuid4().hex,  # ✅ ثابت للتحميل
             name=file.filename,
             category="جامعة سطام",
             size=size_str,
             upload_date=datetime.utcnow(),
             status="نشط",
-            file_path=file_path
+            file_path=file_path,
         )
         db.add(new_doc)
         db.commit()
@@ -264,33 +230,24 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
 
     except Exception as e:
         db.rollback()
+        # حاول تحذف الملف لو انكتب
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"خطأ في رفع الملف: {str(e)}")
 
 
 # =========================================================
-# ✅ Chat endpoint (STATELESS) - لا يحفظ شيء
+# Chat endpoint (STATELESS)
 # =========================================================
 @app.post("/api/chat", response_model=MessageResponse)
-async def send_message(
-    message: MessageCreate,
-    db: Session = Depends(get_db),
-):
+async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     user_text = (message.content or "").strip()
     if not user_text:
         raise HTTPException(400, "اكتب سؤالك من فضلك.")
 
-    settings = db.query(SystemSettings).first()
-    if settings and not settings.chatbot_available:
-        return MessageResponse(
-            id=-1,
-            content="المساعد متوقف حالياً من قبل الإدارة.",
-            sender="assistant",
-            timestamp=datetime.utcnow(),
-            sources=[],
-            attachments=[],
-        )
-
-    # Refine
     refined = llm_service.refine_query(
         user_text,
         context_hint="PSAU University chatbot for academic and administrative questions",
@@ -307,31 +264,39 @@ async def send_message(
             attachments=[],
         )
 
-    # ✅ NEW: إذا المستخدم يطلب ملف -> رجّع رابط تنزيل بدل إجابة طويلة
     request_type = (refined.get("request_type") or "answer").strip().lower()
     file_query = (refined.get("file_query") or "").strip()
 
+    # =========================
+    # FILE REQUEST
+    # =========================
     if request_type == "file":
-        # إذا ما عندنا file_query واضح، استخدم السؤال نفسه
-        q = file_query or user_text
-
+        q = file_query.strip() if file_query and len(file_query.strip()) >= 3 else user_text
         doc = _find_best_document(db, q)
 
         if not doc:
-            # رجّع رد لطيف بدون تخمين
             return MessageResponse(
                 id=int(datetime.utcnow().timestamp()),
-                content="عذرًا، لم أجد ملفًا مطابقًا لطلبك ضمن الملفات المرفوعة حاليًا. جرّب تكتب اسم النموذج/الدليل بشكل أدق.",
+                content="عذرًا، لم أجد ملفًا مطابقًا لطلبك ضمن الملفات المرفوعة حاليًا. جرّب تكتب كلمات مميزة من اسم الملف.",
                 sender="assistant",
                 timestamp=datetime.utcnow(),
                 sources=[],
                 attachments=[],
             )
 
+        # ✅ ضمان وجود public_id حتى لو doc قديم (باستخدام SQL خام)
+        if not getattr(doc, "public_id", None):
+            pid = uuid.uuid4().hex
+            db.execute(
+                text("UPDATE documents SET public_id = :pid WHERE id = :id"),
+                {"pid": pid, "id": doc.id},
+            )
+            db.commit()
+            doc.public_id = pid  # حدّث الكائن الحالي
+
         attachment = AttachmentOut(
-            id=doc.id,
             name=doc.name,
-            url=f"/api/files/{doc.id}",
+            url=f"/api/files/{doc.public_id}",  # ✅ ثابت
             mime=_guess_mime(doc.name or ""),
         )
 
@@ -344,10 +309,11 @@ async def send_message(
             attachments=[attachment],
         )
 
-    # ====== عادي: إجابة نصية ======
+    # =========================
+    # NORMAL ANSWER (RAG)
+    # =========================
     refined_question = (refined.get("refined_question") or user_text).strip()
     intent = (refined.get("intent") or "").strip()
-
     retrieval_query = llm_service.build_retrieval_query(refined) or refined_question or user_text
 
     try:
@@ -362,7 +328,7 @@ async def send_message(
         intent=intent,
         context_docs=context_docs,
         user_role="",
-        system_message=settings.system_message if settings else None,
+        system_message=None,
     )
 
     sources = llm_service.extract_sources(

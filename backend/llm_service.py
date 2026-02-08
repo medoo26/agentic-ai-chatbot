@@ -214,7 +214,7 @@ class LLMService:
         return None
 
     # -----------------------------------------------------
-    # Refiner Prompt
+    # Refiner Prompt (✅ add request_type + file_query)
     # -----------------------------------------------------
     _REFINER_SYSTEM = """
 أنت نظام يفهم اللهجة العامية السعودية/الخليجية ويحوّل سؤال المستخدم إلى صياغة واضحة قابلة للبحث في قاعدة المعرفة الجامعية.
@@ -222,7 +222,7 @@ class LLMService:
 أرجع JSON فقط بدون أي شرح أو نص إضافي.
 
 المفاتيح المطلوبة (بالضبط):
-refined_question, intent, entities, constraints, search_queries, needs_clarification, clarifying_question
+refined_question, intent, entities, constraints, search_queries, needs_clarification, clarifying_question, request_type, file_query
 
 التعليمات:
 - refined_question: صياغة عربية فصحى بسيطة وواضحة تعكس قصد المستخدم الحقيقي.
@@ -233,6 +233,10 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
 - search_queries: 3 إلى 6 عبارات بحث قصيرة ومتنوعة بالعربية تساعد الاسترجاع (RAG).
 - needs_clarification: true إذا السؤال ناقص يمنع إجابة صحيحة.
 - clarifying_question: سؤال واحد فقط إذا needs_clarification=true، وإلا اتركه فارغاً.
+
+- request_type: اختر واحدة فقط: "answer" أو "file"
+  * اجعلها "file" إذا المستخدم يطلب نموذج/ملف/تحميل/رابط/إرسال PDF/DOCX أو "أعطني النموذج".
+- file_query: نص قصير (2-8 كلمات) يمثل اسم الملف/النموذج المطلوب (مثال: "نموذج التفرغ العلمي" / "شروط القبول والتسجيل").
 """.strip()
 
     # -----------------------------------------------------
@@ -254,7 +258,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
             err = self._safe_str(e)
             print("⚠️ Gemini model failed:", model_name, err)
 
-            # fallback تلقائي إذا موديل غير موجود/غير مدعوم
             fallback_model = "gemini-1.0-pro"
             if model_name.strip().lower() != fallback_model:
                 try:
@@ -297,10 +300,24 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         return text
 
     # -----------------------------------------------------
-    # Local fallback refine
+    # Local fallback refine (✅ supports file)
     # -----------------------------------------------------
     def _local_fallback_refine(self, user_text: str) -> Dict[str, Any]:
         t = self.normalize_arabic(user_text or "")
+
+        file_kw = [
+            "نموذج", "ملف", "تحميل", "تنزيل", "نزّل", "نزل", "رابط",
+            "ارسل", "أرسل", "ابي رابط", "pdf", "doc", "docx", "word", "اكسل", "excel"
+        ]
+        lt = (t or "").lower()
+        is_file = any(k in lt for k in file_kw)
+
+        fq = t or ""
+        for k in file_kw:
+            fq = fq.replace(k, " ")
+        fq = re.sub(r"\s+", " ", fq).strip()
+        fq = " ".join(fq.split()[:8]).strip()
+
         return {
             "refined_question": t or (user_text or ""),
             "intent": "other",
@@ -309,6 +326,8 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
             "search_queries": [t] if t else ([user_text] if user_text else []),
             "needs_clarification": False,
             "clarifying_question": "",
+            "request_type": "file" if is_file else "answer",
+            "file_query": fq if is_file else "",
         }
 
     # -----------------------------------------------------
@@ -327,6 +346,8 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
                 "search_queries": [user_text],
                 "needs_clarification": False,
                 "clarifying_question": "",
+                "request_type": "answer",
+                "file_query": "",
                 "direct_response": greet,
             }
 
@@ -341,6 +362,7 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         try:
             data = json.loads(content)
 
+            # ensure keys exist
             for k in [
                 "refined_question",
                 "intent",
@@ -349,10 +371,13 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
                 "search_queries",
                 "needs_clarification",
                 "clarifying_question",
+                "request_type",
+                "file_query",
             ]:
                 if k not in data:
                     data[k] = fallback[k]
 
+            # type checks
             if not isinstance(data.get("entities"), list):
                 data["entities"] = []
             if not isinstance(data.get("constraints"), dict):
@@ -367,6 +392,13 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
             rq = data.get("refined_question") or user_text
             if not isinstance(rq, str) or not rq.strip():
                 data["refined_question"] = user_text
+
+            rt = data.get("request_type")
+            if rt not in ("answer", "file"):
+                data["request_type"] = fallback["request_type"]
+
+            if not isinstance(data.get("file_query"), str):
+                data["file_query"] = ""
 
             return data
         except Exception:
@@ -410,9 +442,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
             return True
         return False
 
-    # -----------------------------------------------------
-    # ✅ NEW: إذا أفضل نتيجة جدول -> رجّع الجدول مباشرة بدون LLM
-    # -----------------------------------------------------
     def _pick_best_doc(self, context_docs: List[Dict]) -> Optional[Dict]:
         docs = [d for d in (context_docs or []) if isinstance(d, dict)]
         if not docs:
@@ -444,7 +473,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         if not content:
             return None
 
-        # لازم يكون Markdown Table فعلاً
         if self._looks_like_markdown_table(content):
             return content
 
@@ -473,7 +501,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
             )
             source = self._clean_source_name(self._safe_str(source)) or f"مصدر {i}"
 
-            # ✅ إذا جدول خليّه كامل (لا تقصه)
             if self._looks_like_markdown_table(content):
                 chunk = content.strip()
             else:
@@ -526,7 +553,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         if not self.append_sources:
             return ans
 
-        # لو الإجابة فيها بالفعل "المصادر:" لا نعيد إضافتها
         if re.search(r"\bالمصادر\s*:", ans):
             return ans
 
@@ -540,7 +566,7 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         return (ans + "\n" + "\n".join(lines)).strip()
 
     # -----------------------------------------------------
-    # Gemini fallback answer (إذا OpenAI 429 أو مو شغال)
+    # Gemini fallback answer
     # -----------------------------------------------------
     def _gemini_answer_from_context(self, refined_question: str, context_text: str, user_role: str, intent: Optional[str] = None) -> str:
         if not self.gemini_ready:
@@ -596,12 +622,10 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
 
         rq = (refined_question or user_query).strip()
 
-        # ✅ إذا أفضل نتيجة جدول -> رجّع الجدول مباشرة (بدون LLM) عشان ما يتحول لقائمة
         direct_table = self._should_return_table_directly(context_docs or [])
         if direct_table:
             return self.append_sources_to_answer(direct_table, context_docs or [])
 
-        # بناء سياق صغير
         context_text = self._build_context(context_docs or [])
         if not context_text:
             return "عذراً، هذه المعلومة غير متوفرة في الملفات المرفوعة حالياً."
@@ -632,12 +656,10 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         final_system = (base_system + "\n\n" + rules).strip() if base_system else rules
         messages = [SystemMessage(content=final_system), HumanMessage(content=rq)]
 
-        # إذا OpenAI مو جاهز -> Gemini جواب
         if not self.llm:
             ans = self._gemini_answer_from_context(rq, context_text, user_role, intent=intent)
             return self.append_sources_to_answer(ans, context_docs or [])
 
-        # OpenAI invoke + fallback على 429
         try:
             llm = self.llm
             try:
@@ -655,7 +677,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
             print("LLM invoke error:", err)
             traceback.print_exc()
 
-            # retry مرة واحدة (اختياري)
             if self.retry_on_429 and ("429" in err or "rate limit" in err.lower()):
                 time.sleep(self.retry_sleep_seconds)
                 try:
@@ -666,7 +687,6 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
                 except Exception:
                     pass
 
-            # fallback Gemini answer
             ans = self._gemini_answer_from_context(rq, context_text, user_role, intent=intent)
             return self.append_sources_to_answer(ans, context_docs or [])
 

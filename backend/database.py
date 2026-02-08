@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -15,31 +16,35 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     Index,
+    text,
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 
 load_dotenv()
 
-# ---------------------------------------------------------
-# Database Config
-# ---------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chatbot.db").strip()
 
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
 )
-
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
 # ---------------------------------------------------------
-# RAG Tables
+# Models
 # ---------------------------------------------------------
 class Document(Base):
     __tablename__ = "documents"
+    # ✅ يمنع إعادة استخدام id في SQLite (AUTOINCREMENT)
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id = Column(Integer, primary_key=True, index=True)
+
+    # ✅ معرف ثابت للتحميل (لا يتغير ولا يتكرر)
+    public_id = Column(String, unique=True, index=True, nullable=True)
+
     name = Column(String, nullable=False)
     category = Column(String, nullable=False)
     file_path = Column(String, nullable=False)
@@ -68,6 +73,7 @@ class DocumentChunk(Base):
 
 Index("ix_document_chunks_document_id", DocumentChunk.document_id)
 
+
 class KnowledgeEntry(Base):
     __tablename__ = "knowledge_entries"
 
@@ -82,9 +88,6 @@ class KnowledgeEntry(Base):
     embedding_id = Column(String)
 
 
-# ---------------------------------------------------------
-# Admin / System Tables
-# ---------------------------------------------------------
 class SystemSettings(Base):
     __tablename__ = "system_settings"
 
@@ -107,15 +110,46 @@ class AdminUser(Base):
 
 
 # ---------------------------------------------------------
-# Init / DB Session
+# Init + Auto-migration for public_id
 # ---------------------------------------------------------
 def init_db():
-    """إنشاء الجداول (لن يحذف أي جداول قديمة موجودة)"""
+    """ينشئ الجداول لو غير موجودة"""
     Base.metadata.create_all(bind=engine)
+    ensure_documents_public_id_column()
+
+
+def ensure_documents_public_id_column():
+    """
+    ✅ حل دائم:
+    - يضيف عمود public_id لو القاعدة قديمة وما فيها العمود.
+    - يعبّي public_id للصفوف القديمة.
+    """
+    if "sqlite" not in DATABASE_URL.lower():
+        # لو انت مستخدم DB ثانية، اعمل migration بالطريقة المناسبة
+        return
+
+    with engine.begin() as conn:
+        # هل العمود موجود؟
+        cols = conn.execute(text("PRAGMA table_info(documents)")).fetchall()
+        col_names = {c[1] for c in cols}  # c[1] = name
+        if "public_id" not in col_names:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN public_id TEXT"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_documents_public_id ON documents(public_id)"))
+
+        # عبّي القيم الناقصة
+        rows = conn.execute(
+            text("SELECT id FROM documents WHERE public_id IS NULL OR public_id = ''")
+        ).fetchall()
+
+        for (doc_id,) in rows:
+            pid = uuid.uuid4().hex
+            conn.execute(
+                text("UPDATE documents SET public_id = :pid WHERE id = :id"),
+                {"pid": pid, "id": doc_id},
+            )
 
 
 def get_db():
-    """توفير جلسة اتصال لقاعدة البيانات"""
     db = SessionLocal()
     try:
         yield db
