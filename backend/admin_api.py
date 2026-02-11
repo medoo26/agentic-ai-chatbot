@@ -12,7 +12,14 @@ from sqlalchemy import desc
 
 from passlib.context import CryptContext
 
-from database import get_db, Document, DocumentChunk, AdminUser
+from database import (
+    get_db,
+    Document,
+    DocumentChunk,
+    AdminUser,
+    SystemSettings,
+    KnowledgeEntry,
+)
 
 security = HTTPBasic()
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
@@ -20,6 +27,9 @@ pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
+# =========================================================
+# Auth
+# =========================================================
 def verify_admin(
     credentials: HTTPBasicCredentials = Depends(security),
     db: Session = Depends(get_db),
@@ -37,6 +47,9 @@ def verify_admin(
     return admin
 
 
+# =========================================================
+# Helpers
+# =========================================================
 def parse_size_to_mb(size: Optional[str]) -> Optional[float]:
     if not size:
         return None
@@ -51,9 +64,10 @@ def parse_size_to_mb(size: Optional[str]) -> Optional[float]:
             return round(num / 1024.0, 2)
         if unit in ("gb", "gib"):
             return round(num * 1024.0, 2)
+        # لو كانت بدون وحدة، نعتبرها MB
+        return round(num, 2)
     except Exception:
         return None
-    return None
 
 
 def safe_remove_file(path: Optional[str]) -> bool:
@@ -68,6 +82,9 @@ def safe_remove_file(path: Optional[str]) -> bool:
     return False
 
 
+# =========================================================
+# Schemas
+# =========================================================
 class DocumentOut(BaseModel):
     id: int
     public_id: Optional[str] = None
@@ -75,6 +92,49 @@ class DocumentOut(BaseModel):
     size_mb: Optional[float] = None
     uploaded_at: Optional[str] = None
     is_active: bool = True
+
+
+class AdminStatsOut(BaseModel):
+    total_documents: int
+    total_chunks: int
+    total_knowledge_entries: int
+    active_knowledge_entries: int
+    chatbot_available: bool
+    last_upload_at: Optional[str] = None
+
+
+# =========================================================
+# Routes
+# =========================================================
+@router.get("/stats", response_model=AdminStatsOut)
+def admin_stats(
+    db: Session = Depends(get_db),
+    _admin: AdminUser = Depends(verify_admin),
+):
+    total_docs = db.query(Document).count()
+    total_chunks = db.query(DocumentChunk).count()
+
+    total_ke = db.query(KnowledgeEntry).count()
+    active_ke = db.query(KnowledgeEntry).filter(KnowledgeEntry.enabled == True).count()
+
+    settings = db.query(SystemSettings).order_by(desc(SystemSettings.id)).first()
+    chatbot_available = bool(settings.chatbot_available) if settings else True
+
+    last_doc = db.query(Document).order_by(desc(Document.upload_date)).first()
+    last_upload = (
+        last_doc.upload_date.isoformat()
+        if last_doc and last_doc.upload_date
+        else None
+    )
+
+    return AdminStatsOut(
+        total_documents=total_docs,
+        total_chunks=total_chunks,
+        total_knowledge_entries=total_ke,
+        active_knowledge_entries=active_ke,
+        chatbot_available=chatbot_available,
+        last_upload_at=last_upload,
+    )
 
 
 @router.get("/documents", response_model=List[DocumentOut])
@@ -112,12 +172,15 @@ def delete_document(
     if not doc:
         raise HTTPException(404, "Document not found")
 
+    # حذف الشنكات المرتبطة
     db.query(DocumentChunk).filter(DocumentChunk.document_id == doc_id).delete(
         synchronize_session=False
     )
 
+    # حذف الملف من الدسك
     removed_file = safe_remove_file(getattr(doc, "file_path", None))
 
+    # حذف السجل
     db.delete(doc)
     db.commit()
 
