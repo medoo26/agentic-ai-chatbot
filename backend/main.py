@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 
 import os
@@ -6,7 +5,7 @@ import re
 import uuid
 import shutil
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
@@ -28,6 +27,23 @@ load_dotenv()
 
 app = FastAPI(title="PSU Chatbot Backend API", version="1.4.3")
 
+# =========================================================
+# Simple topic memory (Follow-up handling)
+# =========================================================
+LAST_TOPIC = ""
+
+# ✅ تخزين خيارات الملفات المؤقتة لما نسأل المستخدم "أي ملف تقصد؟"
+PENDING_CHOICES: Dict[str, Any] = {
+    "article_phrase": "",
+    "candidates": [],      # list of {doc_key, original_name, best_score}
+    "forced_doc_key": "",  # ✅ doc_key المختار من المستخدم
+    "ts": None,
+}
+
+_PRONOUNY = re.compile(
+    r"(اهدافها|مهامها|شروطها|مواعيدها|رسومها|آليتها|طريقتها|كيفها|وش هي|وشو|هذي|هذا|تلك|ذي)\b"
+)
+
 # Admin router (documents list/delete/auth ...)
 app.include_router(admin_router)
 
@@ -46,7 +62,9 @@ pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 # Services
 rag_system = RAGSystem()
 llm_service = LLMService()
-doc_processor = DocumentProcessor(rag_system)
+
+# ✅ مهم: مرّر llm_service للـ DocumentProcessor
+doc_processor = DocumentProcessor(rag_system, llm_service=llm_service)
 
 # =========================================================
 # DB init + Default Admin
@@ -66,7 +84,7 @@ def create_default_admin():
     finally:
         db.close()
 
-# init (✅ migration صار داخل database.init_db() خلاص)
+
 init_db()
 create_default_admin()
 
@@ -76,10 +94,12 @@ create_default_admin()
 class MessageCreate(BaseModel):
     content: str
 
+
 class AttachmentOut(BaseModel):
     name: str
     url: str
     mime: Optional[str] = None
+
 
 class MessageResponse(BaseModel):
     id: int
@@ -88,6 +108,7 @@ class MessageResponse(BaseModel):
     timestamp: datetime
     sources: List[str] = []
     attachments: List[AttachmentOut] = []
+
 
 # =========================================================
 # Helpers
@@ -119,12 +140,81 @@ _AR_STOP = {
     "لو", "ليه", "وش", "ايش", "وشو", "كيف", "ممكن", "فضلا", "فضلاً"
 }
 
-
 def _normalize_ar(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     s = s.replace("ة", "ه").replace("ى", "ي")
+    # أرقام عربية -> إنجليزية
+    trans = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    s = s.translate(trans)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+# =========================================================
+# ✅ Better Arabic retrieval normalization + Article phrase extraction
+# =========================================================
+_RE_ARTICLE_PHRASE = re.compile(
+    r"(الماده|المادة)\s+([^\n\.<،,:؛!\?؟]{1,60})",
+    re.IGNORECASE,
+)
+
+def _fix_ar_spacing(text: str) -> str:
+    """
+    يصلّح لصق الكلمات الشائع مثل: (عشرةمن) -> (عشرة من)
+    ويخفف مشاكل المسافات العامة.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"(\S)(من)\b", r"\1 \2", t)  # فصل "من" إذا انلصقت بالكلمة قبلها
+    t = re.sub(r"\s+", " ", t).strip()     # توحيد المسافات
+    return t
+
+def _extract_article_phrase(user_text: str) -> str:
+    """
+    يرجع عبارة مثل:
+    'المادة الثالثة عشرة'
+    'المادة الثالثة عشر'
+    'المادة 13'
+    'المادة ١٣'
+    """
+    t = _fix_ar_spacing(user_text)
+    m = _RE_ARTICLE_PHRASE.search(t)
+    if not m:
+        return ""
+    phrase = f"المادة {m.group(2)}"
+    phrase = re.sub(r"\s+", " ", phrase).strip()
+    return phrase[:60].strip()
+
+
+def _merge_hits_unique(hits_a: List[Dict[str, Any]], hits_b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    دمج نتائج بدون تكرار (حسب doc_key + chunk_index + hash للمحتوى)
+    """
+    import hashlib
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    for it in (hits_a or []) + (hits_b or []):
+        meta = it.get("metadata") or {}
+        dk = str(meta.get("doc_key") or "")
+        ci = str(meta.get("chunk_index") or "")
+        h = hashlib.md5((it.get("content") or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
+        key = f"{dk}:{ci}:{h}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+
+    def _k(x):
+        sc = x.get("score")
+        if isinstance(sc, (int, float)):
+            return (0, float(sc))
+        return (1, 1e9)
+
+    out.sort(key=_k)
+    return out
 
 
 def _extract_keywords(query: str) -> List[str]:
@@ -171,11 +261,244 @@ def _find_best_document(db: Session, query: str) -> Optional[Document]:
 
 
 # =========================================================
-# Download endpoint (✅ FIXED: use public_id)
+# ✅ Auto-select best doc_key from broad hits
+# =========================================================
+def _pick_best_doc_key_from_hits(hits: List[Dict[str, Any]]) -> str:
+    """
+    Chroma distance: الأقل أفضل.
+    نجمع أفضل distances لكل doc_key ونختار الأقل.
+    """
+    if not hits:
+        return ""
+
+    per_doc: Dict[str, List[float]] = {}
+    for h in hits:
+        meta = h.get("metadata") or {}
+        dk = str(meta.get("doc_key") or "").strip()
+        if not dk:
+            continue
+        sc = h.get("score")
+        if sc is None:
+            continue
+        try:
+            scf = float(sc)
+        except Exception:
+            continue
+        per_doc.setdefault(dk, []).append(scf)
+
+    if not per_doc:
+        for h in hits:
+            meta = h.get("metadata") or {}
+            dk = str(meta.get("doc_key") or "").strip()
+            if dk:
+                return dk
+        return ""
+
+    best_dk = ""
+    best_val = 1e9
+    for dk, scores in per_doc.items():
+        scores_sorted = sorted(scores)[:3]
+        avg = sum(scores_sorted) / max(1, len(scores_sorted))
+        if avg < best_val:
+            best_val = avg
+            best_dk = dk
+
+    return best_dk
+
+
+# =========================================================
+# ✅ Article strict matching helpers
+# =========================================================
+def _article_tokens(article_phrase: str) -> List[str]:
+    """
+    "المادة الثالثة عشرة" -> ["الثالثه", "عشره"]
+    "المادة 13" -> ["13"]
+    "المادة ١٣" -> ["13"]
+    """
+    ap = _fix_ar_spacing(article_phrase)
+    ap = _normalize_ar(ap)
+
+    ap = ap.replace("الماده ", "").replace("المادة ", "").strip()
+
+    toks = re.findall(r"[0-9]+|[\u0600-\u06FF]+", ap)
+    toks = [t.strip() for t in toks if t.strip()]
+
+    STOP = {"من", "في", "على", "الى", "إلى", "عن", "مع", "و", "او", "أو"}
+    toks = [t for t in toks if t not in STOP]
+    return toks[:6]
+
+
+def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) -> List[Dict[str, Any]]:
+    """
+    فلترة صارمة:
+    - لازم المحتوى يحتوي "المادة" + توكنز رقم المادة
+    - يمنع يطلع مادة 65 بدل 59
+    """
+    if not hits:
+        return []
+
+    toks = _article_tokens(article_phrase)
+    if not toks:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        content = (h.get("content") or "")
+        c = _normalize_ar(content)
+
+        if "المادة" not in c and "الماده" not in c:
+            # أحياناً العنوان مخزّن في meta.h2 أكثر من المحتوى
+            pass
+
+        ok = True
+        for t in toks:
+            if t not in c:
+                ok = False
+                break
+
+        if ok:
+            out.append(h)
+
+    out.sort(key=lambda x: float(x.get("score", 1e9)) if isinstance(x.get("score"), (int, float)) else 1e9)
+    return out
+
+
+def _rank_doc_candidates_from_hits(hits: List[Dict[str, Any]], top_n: int = 6) -> List[Dict[str, Any]]:
+    """
+    يرجّع قائمة مرشحين للملفات بناءً على أفضل score (distance الأقل أفضل)
+    لكل doc_key.
+    """
+    best_per_doc: Dict[str, Dict[str, Any]] = {}
+
+    for h in hits or []:
+        meta = h.get("metadata") or {}
+        dk = str(meta.get("doc_key") or "").strip()
+        if not dk:
+            continue
+
+        sc = h.get("score")
+        if not isinstance(sc, (int, float)):
+            continue
+
+        cur = best_per_doc.get(dk)
+        if cur is None or float(sc) < float(cur["best_score"]):
+            best_per_doc[dk] = {
+                "doc_key": dk,
+                "best_score": float(sc),
+                "original_name": (meta.get("original_name") or meta.get("filename") or dk),
+            }
+
+    cands = list(best_per_doc.values())
+    cands.sort(key=lambda x: x["best_score"])
+    return cands[: max(1, top_n)]
+
+
+def _pick_candidate_by_name(user_text: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    يسمح للمستخدم يكتب اسم الملف أو جزء منه بدل رقم.
+    """
+    q = _normalize_ar(user_text)
+    if not q or not candidates:
+        return None
+
+    best = None
+    best_len = 0
+
+    for c in candidates:
+        name = _normalize_ar(str(c.get("original_name") or c.get("doc_key") or ""))
+        if not name:
+            continue
+        if q in name and len(q) > best_len:
+            best = c
+            best_len = len(q)
+
+    return best
+
+
+# =========================================================
+# ✅ NEW: Article retrieval that uses HTML chunk metadata
+# =========================================================
+def _retrieve_article_context(
+    rag: RAGSystem,
+    article_phrase: str,
+    doc_key: str,
+    top_k_find: int = 40,
+    top_k_section: int = 30,
+) -> List[Dict[str, Any]]:
+    """
+    1) نبحث أولاً داخل chunk_type=article_high_level (لأنه أقرب لعنوان المادة)
+    2) إذا لقينا hit مناسب، نقرأ meta.h2 ونجيب كل chunks اللي نفس h2 داخل نفس الملف
+    """
+    if not rag or not article_phrase:
+        return []
+
+    where_find = None
+    if doc_key:
+        # نخليها $and عشان ما يتجاهلها Chroma
+        where_find = {"$and": [{"doc_key": str(doc_key)}, {"chunk_type": "article_high_level"}]}
+    else:
+        where_find = {"chunk_type": "article_high_level"}
+
+    hits = rag.search(
+        article_phrase,
+        top_k=top_k_find,
+        include_neighbors=False,
+        neighbor_window=0,
+        where=where_find,
+    ) or []
+
+    # فلترة: يا من المحتوى يا من h2
+    toks = _article_tokens(article_phrase)
+    if toks:
+        filtered: List[Dict[str, Any]] = []
+        for h in hits:
+            meta = h.get("metadata") or {}
+            h2 = _normalize_ar(str(meta.get("h2") or ""))
+            content = _normalize_ar(str(h.get("content") or ""))
+            blob = f"{h2} {content}".strip()
+
+            ok = True
+            for t in toks:
+                if t not in blob:
+                    ok = False
+                    break
+            if ok:
+                filtered.append(h)
+        hits = filtered
+
+    if not hits:
+        return []
+
+    # أفضل hit
+    hits.sort(key=lambda x: float(x.get("score", 1e9)) if isinstance(x.get("score"), (int, float)) else 1e9)
+    best = hits[0]
+    best_meta = best.get("metadata") or {}
+    best_h2 = str(best_meta.get("h2") or "").strip()
+
+    if not best_h2:
+        # لو ما عندنا h2، نرجّع أفضل hits نفسها
+        return hits[: min(12, len(hits))]
+
+    # الآن نجيب كل أجزاء نفس المادة (نفس h2) داخل الملف
+    where_sec = {"$and": [{"doc_key": str(doc_key)}, {"h2": best_h2}]}
+    sec_hits = rag.search(
+        article_phrase,
+        top_k=top_k_section,
+        include_neighbors=True,
+        neighbor_window=int(os.getenv("RAG_NEIGHBOR_WINDOW", "2")),
+        where=where_sec,
+    ) or []
+
+    # دمج + ترتيب
+    out = _merge_hits_unique(sec_hits, hits[:5])
+    return out
+
+
+# =========================================================
+# Download endpoint (✅ use public_id)
 # =========================================================
 @app.get("/api/files/{public_id}")
 def download_file(public_id: str, db: Session = Depends(get_db)):
-    # مهم: هنا نعتمد على ORM لأن العمود صار موجود بعد migration
     doc = db.query(Document).filter(Document.public_id == public_id).first()
     if not doc:
         raise HTTPException(404, "الملف غير موجود.")
@@ -212,8 +535,9 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
         file_size_bytes = os.path.getsize(file_path)
         size_str = f"{round(file_size_bytes / (1024 * 1024), 2)} MB"
 
+        # 1) احفظ الأصلي في DB
         new_doc = Document(
-            public_id=uuid.uuid4().hex,  # ✅ ثابت للتحميل
+            public_id=uuid.uuid4().hex,
             name=file.filename,
             category="جامعة سطام",
             size=size_str,
@@ -224,13 +548,51 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
         db.add(new_doc)
         db.commit()
 
-        await doc_processor.process_file(file_path)
+        # 2) عالج + فهرس + احفظ النسخة المحوّلة
+        result = None
+        processor_error = None
+        try:
+            result = await doc_processor.process_file(file_path)
+        except Exception as e:
+            processor_error = str(e)
+            print("⚠️ Document processing failed (keeping original file):", e)
 
-        return {"status": "success", "message": f"تم رفع ومعالجة '{file.filename}' بنجاح."}
+        # 3) احفظ النسخة المحوّلة في DB لو موجودة
+        if result:
+            try:
+                converted_path = (result or {}).get("converted_txt_path")
+                converted_name = (result or {}).get("converted_name")
+
+                if converted_path and converted_name and os.path.exists(converted_path):
+                    existing_conv = db.query(Document).filter(Document.name == converted_name).first()
+                    if not existing_conv:
+                        size_bytes2 = os.path.getsize(converted_path)
+                        size_str2 = f"{round(size_bytes2 / (1024 * 1024), 2)} MB"
+
+                        conv_doc = Document(
+                            public_id=uuid.uuid4().hex,
+                            name=converted_name,
+                            category="جامعة سطام (HTML)",
+                            size=size_str2,
+                            upload_date=datetime.utcnow(),
+                            status="نشط",
+                            file_path=converted_path,
+                        )
+                        db.add(conv_doc)
+                        db.commit()
+            except Exception as e:
+                print("⚠️ Failed to save converted HTML doc in DB:", e)
+
+        if processor_error:
+            return {
+                "status": "success",
+                "message": f"تم رفع '{file.filename}' ✅ لكن فشل تحويل HTML مؤقتاً: {processor_error}",
+            }
+
+        return {"status": "success", "message": f"تم رفع ومعالجة '{file.filename}' بنجاح ✅"}
 
     except Exception as e:
         db.rollback()
-        # حاول تحذف الملف لو انكتب
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -240,13 +602,46 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
 
 
 # =========================================================
-# Chat endpoint (STATELESS)
+# Chat endpoint (STATELESS + Follow-up glue)
 # =========================================================
 @app.post("/api/chat", response_model=MessageResponse)
 async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
+    global LAST_TOPIC, PENDING_CHOICES
+
     user_text = (message.content or "").strip()
     if not user_text:
         raise HTTPException(400, "اكتب سؤالك من فضلك.")
+
+    # =========================================================
+    # ✅ Handle "choose doc" reply (number OR file name)
+    # =========================================================
+    forced_doc_key = ""
+
+    if LAST_TOPIC.endswith("::choose_doc") and PENDING_CHOICES.get("candidates"):
+        cands = PENDING_CHOICES.get("candidates") or []
+
+        # اختيار بالرقم
+        m = re.match(r"^\s*([1-9]|10)\s*$", user_text)
+        if m:
+            idx = int(m.group(1))
+            if 1 <= idx <= len(cands):
+                chosen = cands[idx - 1]
+                forced_doc_key = str(chosen.get("doc_key") or "").strip()
+
+        # اختيار باسم الملف
+        if not forced_doc_key:
+            chosen2 = _pick_candidate_by_name(user_text, cands)
+            if chosen2:
+                forced_doc_key = str(chosen2.get("doc_key") or "").strip()
+
+        if forced_doc_key:
+            PENDING_CHOICES = {
+                "article_phrase": "",
+                "candidates": [],
+                "forced_doc_key": forced_doc_key,
+                "ts": datetime.utcnow(),
+            }
+            LAST_TOPIC = ""
 
     refined = llm_service.refine_query(
         user_text,
@@ -284,7 +679,6 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
                 attachments=[],
             )
 
-        # ✅ ضمان وجود public_id حتى لو doc قديم (باستخدام SQL خام)
         if not getattr(doc, "public_id", None):
             pid = uuid.uuid4().hex
             db.execute(
@@ -292,11 +686,11 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
                 {"pid": pid, "id": doc.id},
             )
             db.commit()
-            doc.public_id = pid  # حدّث الكائن الحالي
+            doc.public_id = pid
 
         attachment = AttachmentOut(
             name=doc.name,
-            url=f"/api/files/{doc.public_id}",  # ✅ ثابت
+            url=f"/api/files/{doc.public_id}",
             mime=_guess_mime(doc.name or ""),
         )
 
@@ -314,13 +708,166 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     # =========================
     refined_question = (refined.get("refined_question") or user_text).strip()
     intent = (refined.get("intent") or "").strip()
-    retrieval_query = llm_service.build_retrieval_query(refined) or refined_question or user_text
 
+    retrieval_query = (llm_service.build_retrieval_query(refined) or refined_question or user_text).strip()
+    retrieval_query = _fix_ar_spacing(retrieval_query)
+
+    # Follow-up handling
+    short_q = len(user_text.strip()) <= 25
+    looks_referential = bool(_PRONOUNY.search(_normalize_ar(user_text)))
+
+    if looks_referential and short_q and LAST_TOPIC and not LAST_TOPIC.endswith("::choose_doc"):
+        retrieval_query = _fix_ar_spacing(f"{user_text.strip()} {LAST_TOPIC}".strip())
+        print("🔁 Follow-up detected → new retrieval_query:", retrieval_query)
+
+    # Article phrase
+    article_phrase = _extract_article_phrase(user_text)
+    if article_phrase:
+        retrieval_query = f"{retrieval_query} {article_phrase} نص المادة القواعد التنفيذية".strip()
+        print("📌 Article phrase detected:", article_phrase)
+
+    # Update topic
+    if len(refined_question) >= 20:
+        LAST_TOPIC = refined_question
+        print("🧠 LAST_TOPIC updated:", LAST_TOPIC)
+
+    # -------------------------------------------------
+    # AUTO FILE SELECTION
+    # -------------------------------------------------
+    BROAD_TOP_K = int(os.getenv("RAG_BROAD_TOP_K", "40"))
+    FOCUSED_TOP_K = int(os.getenv("RAG_FOCUSED_TOP_K", "10"))
+    NEIGHBOR_WINDOW = int(os.getenv("RAG_NEIGHBOR_WINDOW", "2"))
+    DIST_THRESHOLD = float(os.getenv("RAG_DISTANCE_THRESHOLD", "0.95"))
+
+    # 1) broad search
     try:
-        context_docs = rag_system.search(retrieval_query, top_k=3) or []
+        broad_hits = rag_system.search(
+            retrieval_query,
+            top_k=BROAD_TOP_K,
+            include_neighbors=False,
+            neighbor_window=0,
+        ) or []
     except Exception as e:
-        print("RAG search error:", e)
+        print("RAG broad search error:", e)
+        broad_hits = []
+
+    # ✅ إذا المستخدم اختار ملف قبل شوي، خذ اختياره مباشرة
+    forced_doc_key2 = str((PENDING_CHOICES or {}).get("forced_doc_key") or "").strip()
+    if forced_doc_key2:
+        best_doc_key = forced_doc_key2
+        print("✅ Forced doc_key selected by user:", best_doc_key)
+    else:
+        best_doc_key = _pick_best_doc_key_from_hits(broad_hits)
+        if best_doc_key:
+            print("🎯 Auto-selected doc_key:", best_doc_key)
+
+    # =========================================================
+    # ✅ NEW: For article questions, retrieve by HTML metadata (h2/article_high_level)
+    # =========================================================
+    if article_phrase:
+        # لو عندك أكثر من ملف فيه نفس المادة -> اسأل المستخدم (نفس فكرتك السابقة)
+        filtered_article_hits = _filter_hits_for_article(broad_hits, article_phrase)
+        candidates = _rank_doc_candidates_from_hits(filtered_article_hits, top_n=6)
+
+        if len(candidates) >= 2 and not best_doc_key:
+            lines = [f"{i}) {c['original_name']}" for i, c in enumerate(candidates, start=1)]
+            LAST_TOPIC = f"{article_phrase}::choose_doc"
+            PENDING_CHOICES = {
+                "article_phrase": article_phrase,
+                "candidates": candidates,
+                "forced_doc_key": "",
+                "ts": datetime.utcnow(),
+            }
+            return MessageResponse(
+                id=int(datetime.utcnow().timestamp()),
+                content=(
+                    f"لقيت **{article_phrase}** موجودة في أكثر من ملف.\n\n"
+                    "أي ملف تقصد؟ اختر رقم أو اكتب اسم الملف:\n"
+                    + "\n".join(lines)
+                ),
+                sender="assistant",
+                timestamp=datetime.utcnow(),
+                sources=[],
+                attachments=[],
+            )
+
+        # استرجاع المادة بالطريقة الصحيحة
+        article_context = _retrieve_article_context(
+            rag=rag_system,
+            article_phrase=article_phrase,
+            doc_key=best_doc_key,
+            top_k_find=60,
+            top_k_section=35,
+        )
+
+        # إذا لقينا شيء: نستخدمه مباشرة
+        if article_context:
+            context_docs = article_context
+        else:
+            context_docs = []
+    else:
         context_docs = []
+
+    # -------------------------------------------------
+    # fallback: normal focused search
+    # -------------------------------------------------
+    if not context_docs:
+        try:
+            if best_doc_key:
+                context_docs = rag_system.search(
+                    retrieval_query,
+                    top_k=FOCUSED_TOP_K,
+                    include_neighbors=True,
+                    neighbor_window=NEIGHBOR_WINDOW,
+                    where={"doc_key": best_doc_key},
+                ) or []
+            else:
+                context_docs = rag_system.search(
+                    retrieval_query,
+                    top_k=FOCUSED_TOP_K,
+                    include_neighbors=True,
+                    neighbor_window=NEIGHBOR_WINDOW,
+                ) or []
+        except Exception as e:
+            print("RAG search error:", e)
+            context_docs = []
+
+    # ✅ Threshold gate (لكن لا نطبقه على "المادة" لأننا نجيبها بنمط section)
+    best_score = None
+    for d in context_docs:
+        sc = d.get("score")
+        if isinstance(sc, (int, float)):
+            best_score = sc if best_score is None else min(best_score, sc)
+
+    if (not article_phrase) and (best_score is not None) and (best_score > DIST_THRESHOLD):
+        print(f"🚫 Best distance {best_score:.4f} > threshold {DIST_THRESHOLD:.4f} → empty context")
+        context_docs = []
+
+    # ✅ DEBUG
+    print("\n================ RAG DEBUG ================")
+    print("user_text:", user_text)
+    print("refined_question:", refined_question)
+    print("intent:", intent)
+    print("retrieval_query:", retrieval_query)
+    print("broad_hits:", len(broad_hits))
+    print("best_doc_key:", best_doc_key)
+    print("hits:", len(context_docs))
+    print("best_score:", best_score)
+    for i, d in enumerate(context_docs[:5], 1):
+        meta = d.get("metadata") or {}
+        content = (d.get("content") or "").strip()
+        print(f"\n--- HIT {i} ---")
+        print("score:", d.get("score"))
+        print("doc_key:", meta.get("doc_key"))
+        print("original_name:", meta.get("original_name") or meta.get("filename"))
+        print("chunk_index:", meta.get("chunk_index"))
+        print("chunk_type:", meta.get("chunk_type"))
+        print("h2:", meta.get("h2"))
+        print("h3:", meta.get("h3"))
+        print("is_table:", meta.get("is_table"))
+        print("content_len:", len(content))
+        print("content_preview:", content[:300].replace("\n", " "))
+    print("===========================================\n")
 
     ai_text = llm_service.generate_response(
         user_query=user_text,
@@ -335,6 +882,10 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         context_docs or [],
         max_sources=int(os.getenv("MAX_SOURCES", "4")),
     )
+
+    # ✅ clear forced selection after answering
+    if PENDING_CHOICES.get("forced_doc_key"):
+        PENDING_CHOICES["forced_doc_key"] = ""
 
     return MessageResponse(
         id=int(datetime.utcnow().timestamp()),
