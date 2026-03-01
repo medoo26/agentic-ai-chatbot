@@ -86,11 +86,14 @@ class LLMService:
     # Markdown-table heuristic
     _RE_MD_TABLE = re.compile(r"^\s*\|?.*?\|.*\n\s*\|?\s*[-:]{3,}", re.MULTILINE)
 
-    # ✅ لالتقاط "المادة ..." من سؤال المستخدم
+    # ✅ يلتقط المادة بكل أشكالها: "المادة 4", "للمادة 4", "للمادة الخامسة", "بمادة 5"
     _RE_ARTICLE_PHRASE = re.compile(
-        r"(?:الماده|المادة)\s+([^\n\.<،,:؛!\?؟]{1,80})",
+        r"(?:لل|ل|بال|وال|فال)?م[اآ]د[هة]\s+([^\n\.<،,:؛!\?؟]{1,80})",
         re.IGNORECASE,
     )
+
+    # ✅ wants_exec_rules detection (query-side)
+    _RE_EXEC_RULES_Q = re.compile(r"\bالقواعد\s+التنفيذية\b", re.IGNORECASE)
 
     def __init__(self):
         # Providers
@@ -128,7 +131,7 @@ class LLMService:
         self.retry_sleep_seconds = float(os.getenv("RETRY_SLEEP_SECONDS") or "2.0")
 
         # HTML conversion configs
-        self.html_provider = (os.getenv("HTML_PROVIDER") or "").strip().lower()  # openai|gemini|""
+        self.html_provider = (os.getenv("HTML_PROVIDER") or "").strip().lower()
         self.html_model_openai = (os.getenv("HTML_MODEL_OPENAI") or self.chat_model).strip()
         self.html_model_gemini = (os.getenv("HTML_MODEL_GEMINI") or self.fallback_answer_model).strip()
         self.html_max_tokens = int(os.getenv("HTML_MAX_TOKENS") or "2048")
@@ -258,46 +261,30 @@ class LLMService:
         return None
 
     # -----------------------------------------------------
-    # ✅ HTML -> TEXT (remove tags for answers context)
+    # ✅ HTML -> TEXT
     # -----------------------------------------------------
     def _html_to_text(self, html: str) -> str:
-        """
-        ✅ Turn HTML chunk into readable plain text (no tags).
-        ✅ Preserves newlines (critical to cut single "المادة").
-        """
         t = (html or "").strip()
         if not t:
             return ""
-
-        # Remove head/script/style
         t = self._RE_HEAD.sub("\n", t)
         t = self._RE_SCRIPT.sub("\n", t)
         t = self._RE_STYLE.sub("\n", t)
-
-        # Add line breaks / separators
         t = re.sub(r"</h[1-6]>", "\n", t, flags=re.IGNORECASE)
         t = re.sub(r"</p>", "\n", t, flags=re.IGNORECASE)
         t = re.sub(r"</tr>", "\n", t, flags=re.IGNORECASE)
         t = re.sub(r"</td>", " | ", t, flags=re.IGNORECASE)
         t = re.sub(r"</th>", " | ", t, flags=re.IGNORECASE)
-
-        # Remove remaining tags
         t = self._RE_TAGS.sub(" ", t)
-
-        # Decode common entities
         for k, v in self._RE_HTML_ENT.items():
             t = t.replace(k, v)
-
         t = t.replace("\u00a0", " ")
         t = t.replace("\r\n", "\n").replace("\r", "\n")
-
-        # ✅ Normalize spaces but keep newlines
         t = re.sub(r"[ \t]+", " ", t)
         t = re.sub(r"\s*\|\s*", " | ", t)
         t = re.sub(r"\n[ \t]+", "\n", t)
         t = re.sub(r"[ \t]+\n", "\n", t)
         t = re.sub(r"\n{3,}", "\n\n", t).strip()
-
         return t
 
     # -----------------------------------------------------
@@ -311,6 +298,8 @@ class LLMService:
         if not m:
             return ""
         phrase = "المادة " + (m.group(1) or "").strip()
+        # ✅ قطع عند "من" أو "في" أو "الفصل"
+        phrase = re.split(r"\s+(?:من|في|عن|الفصل)\b", phrase)[0].strip()
         phrase = re.sub(r"\s+", " ", phrase).strip()
         return phrase[:80]
 
@@ -324,18 +313,12 @@ class LLMService:
         return toks[:8]
 
     def _cut_single_article(self, full_text: str, article_phrase: str) -> str:
-        """
-        ✅ If text contains multiple articles, cut from requested article heading to next article heading.
-        Works on plain text produced by _html_to_text.
-        """
         if not full_text or not article_phrase:
             return ""
-
         toks = self._article_tokens(article_phrase)
         lines = [ln.strip() for ln in (full_text or "").split("\n") if ln.strip()]
         if not lines:
             return ""
-
         start = -1
         for i, ln in enumerate(lines):
             n = self.normalize_arabic(ln)
@@ -348,43 +331,30 @@ class LLMService:
                 if ok:
                     start = i
                     break
-
         if start == -1:
             return ""
-
         end = len(lines)
         for j in range(start + 1, len(lines)):
             n = self.normalize_arabic(lines[j])
             if "المادة" in n:
                 end = j
                 break
-
         out = "\n".join(lines[start:end]).strip()
         return out
 
     # -----------------------------------------------------
-    # ✅ Exec rules extraction (القواعد التنفيذية للمادة ...)
+    # ✅ Exec rules extraction
     # -----------------------------------------------------
     def _is_exec_rules_request(self, text: str) -> bool:
-        t = (text or "").strip()
-        if not t:
-            return False
-        return bool(self._RE_EXEC_RULES.search(t))
+        return bool(self._RE_EXEC_RULES.search((text or "").strip()))
 
     def _cut_exec_rules_block(self, full_text: str, article_phrase: str) -> str:
-        """
-        ✅ يقص "القواعد التنفيذية للمادة X" فقط:
-        من سطر "القواعد التنفيذية للمادة ..." إلى قبل "المادة ..." التالية.
-        """
         if not full_text or not article_phrase:
             return ""
-
         toks = self._article_tokens(article_phrase)
         lines = [ln.strip() for ln in (full_text or "").split("\n") if ln.strip()]
         if not lines:
             return ""
-
-        # ابحث عن سطر "القواعد التنفيذية للمادة X"
         start = -1
         for i, ln in enumerate(lines):
             n = self.normalize_arabic(ln)
@@ -397,48 +367,37 @@ class LLMService:
                 if ok:
                     start = i
                     break
-
         if start == -1:
             return ""
-
-        # نهاية البلوك: أول سطر يبدأ بـ "المادة ..." بعده
         end = len(lines)
         for j in range(start + 1, len(lines)):
             n = self.normalize_arabic(lines[j])
             if n.startswith("المادة "):
                 end = j
                 break
-
         return "\n".join(lines[start:end]).strip()
 
     def _extract_exec_rules_only(self, rq: str, context_docs: List[Dict[str, Any]]) -> str:
-        """
-        ✅ يرجّع القواعد التنفيذية للمادة المطلوبة فقط.
-        """
         article_phrase = self._extract_article_phrase(rq)
         if not article_phrase:
             return ""
-
         docs = self._best_docs(context_docs or [], max_docs=80)
         for d in docs:
             raw = self._safe_str(d.get("content") or "").strip()
             if not raw:
                 continue
-
             txt = self._html_to_text(raw).strip()
             if not txt:
                 continue
-
             cut = self._cut_exec_rules_block(txt, article_phrase)
             if cut:
                 if len(cut) > self.article_direct_max_chars:
                     cut = cut[: self.article_direct_max_chars].rstrip() + "…"
                 return cut.strip()
-
         return ""
 
     # -----------------------------------------------------
-    # ✅ HTML post-process: strip fences + sanitize + force valid doc
+    # ✅ HTML post-process
     # -----------------------------------------------------
     def _strip_code_fences(self, text: str) -> str:
         t = (text or "").strip()
@@ -453,13 +412,9 @@ class LLMService:
         return (m.group(1) if m else html_doc).strip()
 
     def _ensure_valid_html_document(self, html_or_fragment: str, title: str) -> str:
-        """
-        ✅ يضمن Valid HTML document حتى لو دخلنا fragment فقط.
-        """
         title = (title or "Document").strip() or "Document"
         frag = (html_or_fragment or "").strip()
         body_inner = self._extract_body_inner(frag)
-
         out = f"""<!doctype html>
 <html lang="ar">
 <head>
@@ -474,31 +429,22 @@ class LLMService:
         return out
 
     def _sanitize_html_allowed_tags(self, html_doc: str) -> str:
-        """
-        ✅ يسمح فقط بتاقات:
-        html, head, meta, title, body, h2, h3, p, table, thead, tbody, tr, th, td
-        """
         html_doc = (html_doc or "").strip()
         if not html_doc:
             return ""
-
-        # remove script/style entirely
         html_doc = re.sub(r"<script\b.*?</script>", " ", html_doc, flags=re.IGNORECASE | re.DOTALL)
         html_doc = re.sub(r"<style\b.*?</style>", " ", html_doc, flags=re.IGNORECASE | re.DOTALL)
         html_doc = re.sub(r"<!--.*?-->", " ", html_doc, flags=re.DOTALL)
-
         allowed = {
             "html", "head", "meta", "title", "body",
-            "h2", "h3", "p",
+            "h2", "h3", "h4", "p",
             "table", "thead", "tbody", "tr", "th", "td"
         }
-
         def _tag_repl(m):
             tag = (m.group(1) or "").lower()
             if tag in allowed:
                 return m.group(0)
-            return " "  # drop tag
-
+            return " "
         html_doc = re.sub(r"</?\s*([a-zA-Z0-9]+)\b[^>]*>", _tag_repl, html_doc)
         html_doc = re.sub(r"[ \t]+", " ", html_doc)
         html_doc = re.sub(r"\n{3,}", "\n\n", html_doc).strip()
@@ -575,15 +521,12 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         )
         if not text:
             return ""
-
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
         if m:
             return m.group(1).strip()
-
         m2 = re.search(r"(\{.*\})", text, flags=re.DOTALL)
         if m2:
             return m2.group(1).strip()
-
         return text
 
     # -----------------------------------------------------
@@ -591,20 +534,17 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
     # -----------------------------------------------------
     def _local_fallback_refine(self, user_text: str) -> Dict[str, Any]:
         t = self.normalize_arabic(user_text or "")
-
         file_kw = [
             "نموذج", "ملف", "تحميل", "تنزيل", "نزّل", "نزل", "رابط",
             "ارسل", "أرسل", "ابي رابط", "pdf", "doc", "docx", "word", "اكسل", "excel"
         ]
         lt = (t or "").lower()
         is_file = any(k in lt for k in file_kw)
-
         fq = t or ""
         for k in file_kw:
             fq = fq.replace(k, " ")
         fq = re.sub(r"\s+", " ", fq).strip()
         fq = " ".join(fq.split()[:8]).strip()
-
         return {
             "refined_question": t or (user_text or ""),
             "intent": "other",
@@ -648,17 +588,10 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         fallback = self._local_fallback_refine(user_text)
         try:
             data = json.loads(content)
-
             for k in [
-                "refined_question",
-                "intent",
-                "entities",
-                "constraints",
-                "search_queries",
-                "needs_clarification",
-                "clarifying_question",
-                "request_type",
-                "file_query",
+                "refined_question", "intent", "entities", "constraints",
+                "search_queries", "needs_clarification", "clarifying_question",
+                "request_type", "file_query",
             ]:
                 if k not in data:
                     data[k] = fallback[k]
@@ -699,18 +632,14 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         return (refined.get("refined_question", "") or "").strip()
 
     # -----------------------------------------------------
-    # ✅ HTML conversion (VALID HTML + table aware)
+    # ✅ HTML conversion
     # -----------------------------------------------------
     def to_structured_html(self, raw_text: str, file_title: Optional[str] = None) -> str:
         raw_text = (raw_text or "").strip()
         if not raw_text:
             return ""
-
         title = (file_title or "Document").strip() or "Document"
-
-        # Hint: detect markdown table so LLM is pushed to create <table>
         has_md_table = bool(self._RE_MD_TABLE.search(raw_text))
-
         rules_extra = ""
         if has_md_table:
             rules_extra = "\n- إذا وجدت جدول بصيغة Markdown (علامة | وخط ---) لازم تحوله إلى <table> (thead/tbody/tr/th/td)."
@@ -727,11 +656,15 @@ FILE_NAME_TITLE (مهم جدًا): {title}
    <html lang="ar"> ثم <head> ثم <meta charset="utf-8"> ثم <title> ثم </head> ثم <body> ثم المحتوى ثم </body> ثم </html>
 4) <title> لازم يكون مطابق لـ FILE_NAME_TITLE حرفيًا.
 5) داخل <body> استخدم فقط هذه التاقات:
-   <h2>, <h3>, <p>, <table>, <thead>, <tbody>, <tr>, <th>, <td>
+   <h2>, <h3>, <h4>, <p>, <table>, <thead>, <tbody>, <tr>, <th>, <td>
 6) ممنوع أي تاقات أخرى (مثل div/span/a/img/script/style).
 7) لا تنشئ <table> إلا إذا كان هناك جدول واضح (صفوف/أعمدة) أو كان النص واضح أنه جدول.
 {rules_extra}
 8) تأكد أن كل التاقات مغلقة بشكل صحيح.
+9) أي سطر يبدأ بكلمة "المادة" أو "الماده" يجب تحويله إلى عنوان: <h3>المادة ...</h3> (ممنوع يكون داخل <p>).
+10) أي سطر يبدأ بـ "القواعد التنفيذية للمادة" يجب تحويله إلى عنوان فرعي داخل المادة: <h4>القواعد التنفيذية للمادة ...</h4>.
+11) أي سطر يبدأ بـ "الفصل" أو "الباب" يكون <h2>.
+12) بقية الفقرات تكون داخل <p>.
 
 المحتوى:
 <<<
@@ -739,9 +672,7 @@ FILE_NAME_TITLE (مهم جدًا): {title}
 >>>
 """.strip()
 
-        # Prefer OpenAI if available unless forced
         use_openai = (self.html_provider == "openai") or (not self.html_provider and self.openai_key and self.llm is not None)
-
         out = ""
 
         if use_openai and self.openai_key:
@@ -773,12 +704,10 @@ FILE_NAME_TITLE (مهم جدًا): {title}
                 print("⚠️ Gemini HTML convert failed:", self._safe_str(e))
                 out = ""
 
-        # ✅ HARD guarantee (even if model returns fragment/garbage)
         out = self._strip_code_fences(out)
         out = self._ensure_valid_html_document(out, title)
         out = self._sanitize_html_allowed_tags(out)
         out = self._ensure_valid_html_document(out, title)
-
         return (out or "").strip()
 
     # -----------------------------------------------------
@@ -832,45 +761,32 @@ FILE_NAME_TITLE (مهم جدًا): {title}
         return docs[0] if docs else None
 
     def _should_return_table_directly(self, context_docs: List[Dict]) -> Optional[str]:
-        """
-        ✅ إذا أفضل نتيجة جدول: رجّعها "كنص جدول" بدون HTML tags
-        عشان ما يطلع للمستخدم تاقات.
-        """
         best = self._pick_best_doc(context_docs or [])
         if not best:
             return None
-
         meta = best.get("metadata") or {}
         if not isinstance(meta, dict):
             meta = {}
-
         is_table_meta = bool(meta.get("is_table")) or bool(best.get("is_full_table"))
         content = self._safe_str(best.get("content") or "").strip()
         if not content:
             return None
-
-        # detect by meta OR by html
         if is_table_meta or self._looks_like_html_table(content) or self._looks_like_markdown_table(content):
             txt = self._html_to_text(content)
             return txt.strip() if txt.strip() else content.strip()
-
         return None
 
     def _build_context(self, context_docs: List[Dict]) -> str:
         picked = self._best_docs(context_docs or [], self.max_docs_in_context)
-
         blocks: List[str] = []
         used = 0
-
         for i, doc in enumerate(picked, 1):
             raw_content = self._safe_str(doc.get("content", "")).strip()
             if not raw_content:
                 continue
-
             meta = doc.get("metadata") or {}
             if not isinstance(meta, dict):
                 meta = {}
-
             source = (
                 meta.get("original_name")
                 or meta.get("filename")
@@ -878,32 +794,25 @@ FILE_NAME_TITLE (مهم جدًا): {title}
                 or f"مصدر {i}"
             )
             source = self._clean_source_name(self._safe_str(source)) or f"مصدر {i}"
-
             content_no_tags = self._html_to_text(raw_content)
-
             if self._looks_like_markdown_table(content_no_tags):
                 chunk = content_no_tags.strip()
             else:
                 chunk = self._compress_text(content_no_tags, self.max_chars_per_doc)
-
             block = f"[{i}] {source}\n{chunk}"
             if used + len(block) > self.max_total_context_chars:
                 break
-
             blocks.append(block)
             used += len(block)
-
         return "\n\n".join(blocks).strip()
 
     def extract_sources(self, context_docs: List[Dict], max_sources: int = 4) -> List[str]:
         sources: List[str] = []
         seen = set()
-
         for doc in self._best_docs(context_docs or [], max_docs=max_sources * 6):
             meta = doc.get("metadata") or {}
             if not isinstance(meta, dict):
                 meta = {}
-
             name = (
                 meta.get("original_name")
                 or meta.get("filename")
@@ -912,41 +821,34 @@ FILE_NAME_TITLE (مهم جدًا): {title}
                 or meta.get("source")
                 or meta.get("path")
             )
-
             name = self._clean_source_name(self._safe_str(name))
             if not name:
                 continue
-
             key = name.lower().strip()
             if key in seen:
                 continue
             seen.add(key)
-
             sources.append(name)
             if len(sources) >= max_sources:
                 break
-
         return sources
 
     def append_sources_to_answer(self, answer: str, context_docs: List[Dict]) -> str:
         ans = (answer or "").strip()
         if not self.append_sources:
             return ans
-
         if re.search(r"\bالمصادر\s*:", ans):
             return ans
-
         srcs = self.extract_sources(context_docs or [], max_sources=self.max_sources)
         if not srcs:
             return ans
-
         lines = ["", "المصادر:"]
         for i, s in enumerate(srcs, 1):
             lines.append(f"- [{i}] {s}")
         return (ans + "\n" + "\n".join(lines)).strip()
 
     # -----------------------------------------------------
-    # ✅ Article direct return (ONLY requested article)
+    # ✅ Article direct return
     # -----------------------------------------------------
     def _is_article_request(self, text: str) -> bool:
         t = (text or "").strip()
@@ -954,31 +856,55 @@ FILE_NAME_TITLE (مهم جدًا): {title}
             return False
         return bool(self._RE_ARTICLE_WORD.search(t))
 
+    def _is_exec_rules_query(self, text: str) -> bool:
+        return bool(self._RE_EXEC_RULES_Q.search((text or "").strip()))
+
     def _extract_requested_article_only(self, rq: str, context_docs: List[Dict[str, Any]]) -> str:
-        """
-        ✅ يرجّع فقط المادة المطلوبة (بدقة) بدل تجميع مواد كثيرة.
-        """
         article_phrase = self._extract_article_phrase(rq)
         if not article_phrase:
             return ""
-
         docs = self._best_docs(context_docs or [], max_docs=60)
         for d in docs:
             raw = self._safe_str(d.get("content") or "").strip()
             if not raw:
                 continue
-
             txt = self._html_to_text(raw).strip()
             if not txt:
                 continue
-
             cut = self._cut_single_article(txt, article_phrase)
             if cut:
                 if len(cut) > self.article_direct_max_chars:
                     cut = cut[: self.article_direct_max_chars].rstrip() + "…"
                 return cut.strip()
-
         return ""
+
+    # -----------------------------------------------------
+    # ✅ build_retrieval_query_smart
+    # الجديد: يضيف article_phrase في الـ query لمساعدة RAG
+    # -----------------------------------------------------
+    def build_retrieval_query_smart(self, refined: Dict[str, Any], user_query: str = "") -> str:
+        """
+        ✅ يبني query محسّن للـ RAG يضمن أن رقم المادة واضح في الـ query.
+        استخدمه بدل build_retrieval_query في main.py/chatbot.
+        """
+        rq = (refined.get("refined_question") or user_query or "").strip()
+
+        # إذا فيه طلب مادة، نضيف نص المادة بوضوح في الـ query
+        article_phrase = self._extract_article_phrase(rq)
+        wants_rules = self._is_exec_rules_query(rq)
+
+        base_query = self.build_retrieval_query(refined)
+
+        if not article_phrase:
+            return base_query
+
+        # نبني retrieval query واضح يتضمن رقم المادة + نوع الطلب
+        if wants_rules:
+            retrieval_query = f"{base_query} {article_phrase} نص القواعد التنفيذية"
+        else:
+            retrieval_query = f"{base_query} {article_phrase} نص المادة"
+
+        return retrieval_query.strip()
 
     # -----------------------------------------------------
     # Gemini fallback answer
@@ -1017,7 +943,7 @@ FILE_NAME_TITLE (مهم جدًا): {title}
         return out.strip() or "عذراً، لم أتمكن من استخراج إجابة من الملفات."
 
     # -----------------------------------------------------
-    # Answer generation
+    # ✅ generate_response (محسّن)
     # -----------------------------------------------------
     def generate_response(
         self,
@@ -1038,25 +964,25 @@ FILE_NAME_TITLE (مهم جدًا): {title}
 
         rq = (refined_question or user_query).strip()
 
-        # ✅ إذا يطلب "القواعد التنفيذية للمادة ..." رجّعها مباشرة (بدون LLM)
+        # ✅ 1) القواعد التنفيذية للمادة — رجّعها مباشرة
         if self._is_exec_rules_request(rq) and self._is_article_request(rq):
             direct_rules = self._extract_exec_rules_only(rq, context_docs or [])
             if direct_rules:
                 return self.append_sources_to_answer(direct_rules, context_docs or [])
 
-        # ✅ لو سؤال "المادة ..." حاول ترجع المادة فقط،
-        # وإذا فشل لا توقف — كمل للمسار العادي عشان LLM يجاوب من السياق
+        # ✅ 2) طلب مادة محددة — رجّعها مباشرة إذا لقيناها في الـ context
         if self._is_article_request(rq):
             direct = self._extract_requested_article_only(rq, context_docs or [])
             if direct:
                 return self.append_sources_to_answer(direct, context_docs or [])
-            # لا ترجع "غير متوفرة" هنا
+            # ✅ لا توقف هنا — كمّل للـ LLM (قد يكون السياق يحتوي على المادة بصيغة مختلفة)
 
-        # ✅ direct table return (يميز الجدول)
+        # ✅ 3) جدول مباشر
         direct_table = self._should_return_table_directly(context_docs or [])
         if direct_table:
             return self.append_sources_to_answer(direct_table, context_docs or [])
 
+        # ✅ 4) بناء السياق وإرساله للـ LLM
         context_text = self._build_context(context_docs or [])
         if not context_text:
             return "عذراً، هذه المعلومة غير متوفرة في الملفات المرفوعة حالياً."
@@ -1064,6 +990,18 @@ FILE_NAME_TITLE (مهم جدًا): {title}
         base_system = (system_message or "").strip()
         role_line = f"دور المستخدم: {user_role}".strip()
         intent_line = f"نوع الطلب: {intent}".strip() if intent else "نوع الطلب: غير محدد"
+
+        # ✅ إذا طلب مادة، نعطي LLM تعليمات خاصة لإخراج المادة فقط
+        article_extra = ""
+        if self._is_article_request(rq):
+            article_phrase = self._extract_article_phrase(rq)
+            if article_phrase:
+                article_extra = f"""
+تعليمات خاصة (مهمة جداً):
+- المستخدم يطلب فقط: {article_phrase}
+- لا تذكر أي مادة أخرى، اكتب فقط نص {article_phrase} المذكور في النص.
+- إذا لم تجد {article_phrase} بالضبط في النص، قل: "عذراً، {article_phrase} غير متوفرة في الملفات المرفوعة حالياً."
+""".strip()
 
         rules = f"""
 أنت مساعد رسمي لجامعة الأمير سطام.
@@ -1080,6 +1018,8 @@ FILE_NAME_TITLE (مهم جدًا): {title}
 5) لا تذكر كلمات مثل (سياق، ملف، مستند، RAG).
 6) اكتب بالعربية الفصحى وبأسلوب رسمي.
 7) ممنوع إرجاع أي تاقات HTML أو أكواد.
+
+{article_extra}
 
 النص الرسمي المعتمد:
 {context_text}
