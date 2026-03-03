@@ -35,10 +35,12 @@ app = FastAPI(title="PSU Chatbot Backend API", version="1.5.0")
 LAST_TOPIC = ""
 
 # ✅ تخزين خيارات الملفات المؤقتة لما نسأل المستخدم "أي ملف تقصد؟"
+# ✅ أضفنا pending_user_text عشان لما يختار ملف (زر) نرجع للسؤال الأصلي ونجيب الجواب فوراً
 PENDING_CHOICES: Dict[str, Any] = {
     "article_phrase": "",
     "candidates": [],
     "forced_doc_key": "",
+    "pending_user_text": "",
     "ts": None,
 }
 
@@ -48,7 +50,9 @@ _PRONOUNY = re.compile(
 
 app.include_router(admin_router)
 
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",")
+cors_origins = os.getenv(
+    "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+).split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in cors_origins if o.strip()],
@@ -93,12 +97,19 @@ create_default_admin()
 # =========================================================
 class MessageCreate(BaseModel):
     content: str
+    # ✅ من الفرونت وقت ضغط زر اختيار الملف
+    choice_doc_key: Optional[str] = None
 
 
 class AttachmentOut(BaseModel):
     name: str
     url: str
     mime: Optional[str] = None
+
+
+class ChoiceOut(BaseModel):
+    label: str
+    doc_key: str
 
 
 class MessageResponse(BaseModel):
@@ -108,6 +119,8 @@ class MessageResponse(BaseModel):
     timestamp: datetime
     sources: List[str] = []
     attachments: List[AttachmentOut] = []
+    # ✅ خيارات تظهر كأزرار في الواجهة
+    choices: List[ChoiceOut] = []
 
 
 # =========================================================
@@ -135,9 +148,36 @@ def _guess_mime(filename: str) -> str:
 
 
 _AR_STOP = {
-    "من", "في", "على", "الى", "إلى", "عن", "مع", "و", "او", "أو", "هذا", "هذه",
-    "عطني", "ابغى", "أبغى", "ارسل", "أرسل", "نموذج", "ملف", "تحميل", "رابط",
-    "لو", "ليه", "وش", "ايش", "وشو", "كيف", "ممكن", "فضلا", "فضلاً"
+    "من",
+    "في",
+    "على",
+    "الى",
+    "إلى",
+    "عن",
+    "مع",
+    "و",
+    "او",
+    "أو",
+    "هذا",
+    "هذه",
+    "عطني",
+    "ابغى",
+    "أبغى",
+    "ارسل",
+    "أرسل",
+    "نموذج",
+    "ملف",
+    "تحميل",
+    "رابط",
+    "لو",
+    "ليه",
+    "وش",
+    "ايش",
+    "وشو",
+    "كيف",
+    "ممكن",
+    "فضلا",
+    "فضلاً",
 }
 
 
@@ -197,7 +237,10 @@ def _find_best_document(db: Session, query: str) -> Optional[Document]:
     if not q:
         return None
     q_norm = _normalize_ar(q)
-    if any(ext in q_norm for ext in [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".pptx", ".ppt"]):
+    if any(
+        ext in q_norm
+        for ext in [".pdf", ".docx", ".doc", ".txt", ".xlsx", ".pptx", ".ppt"]
+    ):
         doc = (
             db.query(Document)
             .filter(Document.name.ilike(f"%{q}%"))
@@ -280,7 +323,9 @@ def _article_tokens(article_phrase: str) -> List[str]:
     return toks[:6]
 
 
-def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) -> List[Dict[str, Any]]:
+def _filter_hits_for_article(
+    hits: List[Dict[str, Any]], article_phrase: str
+) -> List[Dict[str, Any]]:
     if not hits:
         return []
     toks = _article_tokens(article_phrase)
@@ -290,11 +335,13 @@ def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) ->
     out: List[Dict[str, Any]] = []
     for h in hits:
         meta = h.get("metadata") or {}
-        blob = " ".join([
-            _normalize_ar(str(meta.get("h2") or "")),
-            _normalize_ar(str(meta.get("h3") or "")),
-            _normalize_ar(str(h.get("content") or "")),
-        ]).strip()
+        blob = " ".join(
+            [
+                _normalize_ar(str(meta.get("h2") or "")),
+                _normalize_ar(str(meta.get("h3") or "")),
+                _normalize_ar(str(h.get("content") or "")),
+            ]
+        ).strip()
 
         ok = True
         for t in toks:
@@ -304,11 +351,17 @@ def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) ->
         if ok:
             out.append(h)
 
-    out.sort(key=lambda x: float(x.get("score", 1e9)) if isinstance(x.get("score"), (int, float)) else 1e9)
+    out.sort(
+        key=lambda x: float(x.get("score", 1e9))
+        if isinstance(x.get("score"), (int, float))
+        else 1e9
+    )
     return out
 
 
-def _rank_doc_candidates_from_hits(hits: List[Dict[str, Any]], top_n: int = 6) -> List[Dict[str, Any]]:
+def _rank_doc_candidates_from_hits(
+    hits: List[Dict[str, Any]], top_n: int = 6
+) -> List[Dict[str, Any]]:
     best_per_doc: Dict[str, Dict[str, Any]] = {}
     for h in hits or []:
         meta = h.get("metadata") or {}
@@ -330,7 +383,9 @@ def _rank_doc_candidates_from_hits(hits: List[Dict[str, Any]], top_n: int = 6) -
     return cands[: max(1, top_n)]
 
 
-def _pick_candidate_by_name(user_text: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _pick_candidate_by_name(
+    user_text: str, candidates: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
     q = _normalize_ar(user_text)
     if not q or not candidates:
         return None
@@ -379,11 +434,13 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
 
         existing_doc = db.query(Document).filter(Document.name == file.filename).first()
         if existing_doc:
-            results.append({
-                "status": "exists",
-                "filename": file.filename,
-                "message": f"الملف '{file.filename}' موجود مسبقًا ولم يتم الحفظ."
-            })
+            results.append(
+                {
+                    "status": "exists",
+                    "filename": file.filename,
+                    "message": f"الملف '{file.filename}' موجود مسبقًا ولم يتم الحفظ.",
+                }
+            )
             try:
                 await file.close()
             except Exception:
@@ -426,7 +483,9 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
                     converted_path = (result or {}).get("converted_txt_path")
                     converted_name = (result or {}).get("converted_name")
                     if converted_path and converted_name and os.path.exists(converted_path):
-                        existing_conv = db.query(Document).filter(Document.name == converted_name).first()
+                        existing_conv = (
+                            db.query(Document).filter(Document.name == converted_name).first()
+                        )
                         if not existing_conv:
                             size_bytes2 = os.path.getsize(converted_path)
                             size_str2 = f"{round(size_bytes2 / (1024 * 1024), 2)} MB"
@@ -445,17 +504,21 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
                     print("⚠️ Failed to save converted HTML doc in DB:", e)
 
             if processor_error:
-                results.append({
-                    "status": "success",
-                    "filename": file.filename,
-                    "message": f"تم رفع '{file.filename}' ✅ لكن فشل تحويل HTML مؤقتاً: {processor_error}",
-                })
+                results.append(
+                    {
+                        "status": "success",
+                        "filename": file.filename,
+                        "message": f"تم رفع '{file.filename}' ✅ لكن فشل تحويل HTML مؤقتاً: {processor_error}",
+                    }
+                )
             else:
-                results.append({
-                    "status": "success",
-                    "filename": file.filename,
-                    "message": f"تم رفع ومعالجة '{file.filename}' بنجاح ✅",
-                })
+                results.append(
+                    {
+                        "status": "success",
+                        "filename": file.filename,
+                        "message": f"تم رفع ومعالجة '{file.filename}' بنجاح ✅",
+                    }
+                )
 
         except Exception as e:
             db.rollback()
@@ -464,11 +527,13 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
                     os.remove(file_path)
             except Exception:
                 pass
-            results.append({
-                "status": "error",
-                "filename": file.filename,
-                "message": f"خطأ في رفع الملف: {str(e)}"
-            })
+            results.append(
+                {
+                    "status": "error",
+                    "filename": file.filename,
+                    "message": f"خطأ في رفع الملف: {str(e)}",
+                }
+            )
 
         try:
             await file.close()
@@ -485,35 +550,27 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
 async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     global LAST_TOPIC, PENDING_CHOICES
 
-    user_text = (message.content or "").strip()
-    if not user_text:
-        raise HTTPException(400, "اكتب سؤالك من فضلك.")
-
-    # =========================================================
-    # ✅ Handle "choose doc" reply
-    # =========================================================
+    # ✅ إذا جاي اختيار زر (doc_key) نخزنّه ونرجع للسؤال الأصلي
+    choice_doc_key = (message.choice_doc_key or "").strip()
     forced_doc_key = ""
 
-    if LAST_TOPIC.endswith("::choose_doc") and PENDING_CHOICES.get("candidates"):
-        cands = PENDING_CHOICES.get("candidates") or []
-        m = re.match(r"^\s*([1-9]|10)\s*$", user_text)
-        if m:
-            idx = int(m.group(1))
-            if 1 <= idx <= len(cands):
-                chosen = cands[idx - 1]
-                forced_doc_key = str(chosen.get("doc_key") or "").strip()
-        if not forced_doc_key:
-            chosen2 = _pick_candidate_by_name(user_text, cands)
-            if chosen2:
-                forced_doc_key = str(chosen2.get("doc_key") or "").strip()
-        if forced_doc_key:
-            PENDING_CHOICES = {
-                "article_phrase": "",
-                "candidates": [],
-                "forced_doc_key": forced_doc_key,
-                "ts": datetime.utcnow(),
-            }
-            LAST_TOPIC = ""
+    if choice_doc_key:
+        forced_doc_key = choice_doc_key
+        # لو عندنا سؤال أصلي محفوظ، نرجع له عشان نعطي الجواب مباشرة
+        pending_q = (PENDING_CHOICES.get("pending_user_text") or "").strip()
+        if pending_q:
+            user_text = pending_q
+        else:
+            user_text = (message.content or "").strip()  # fallback
+        # نظف حالة الاختيار (بنخلي forced_doc_key يمر لاحقاً)
+        LAST_TOPIC = ""
+        PENDING_CHOICES["forced_doc_key"] = forced_doc_key
+        PENDING_CHOICES["candidates"] = []
+    else:
+        user_text = (message.content or "").strip()
+
+    if not user_text:
+        raise HTTPException(400, "اكتب سؤالك من فضلك.")
 
     # =========================================================
     # Refine query
@@ -532,6 +589,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
             timestamp=datetime.utcnow(),
             sources=[],
             attachments=[],
+            choices=[],
         )
 
     request_type = (refined.get("request_type") or "answer").strip().lower()
@@ -539,8 +597,9 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
 
     # =========================
     # FILE REQUEST
+    # (مهم) إذا عندنا اختيار doc_key من الزر → لا تعاملها كطلب ملف حتى لو المستخدم ضغط اسم ملف
     # =========================
-    if request_type == "file":
+    if request_type == "file" and not forced_doc_key:
         q = file_query.strip() if file_query and len(file_query.strip()) >= 3 else user_text
         doc = _find_best_document(db, q)
         if not doc:
@@ -551,6 +610,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
                 timestamp=datetime.utcnow(),
                 sources=[],
                 attachments=[],
+                choices=[],
             )
         if not getattr(doc, "public_id", None):
             pid = uuid.uuid4().hex
@@ -572,6 +632,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
             timestamp=datetime.utcnow(),
             sources=[],
             attachments=[attachment],
+            choices=[],
         )
 
     # =========================
@@ -617,7 +678,10 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     broad_hits: List[Dict[str, Any]] = []
     best_doc_key = ""
 
-    forced_doc_key2 = str((PENDING_CHOICES or {}).get("forced_doc_key") or "").strip() or forced_doc_key
+    forced_doc_key2 = (
+        forced_doc_key
+        or str((PENDING_CHOICES or {}).get("forced_doc_key") or "").strip()
+    )
 
     # =========================================================
     # ✅ SEMANTIC ONLY FLOW
@@ -644,27 +708,31 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         if forced_doc_key2:
             best_doc_key = forced_doc_key2
         else:
-            # ✅ إذا أكثر من ملف → اسأل المستخدم
+            # ✅ إذا أكثر من ملف → رجّع choices أزرار
             if len(candidates) >= 2:
-                lines = [f"{i}) {c['original_name']}" for i, c in enumerate(candidates, start=1)]
                 LAST_TOPIC = f"{article_phrase}::choose_doc"
                 PENDING_CHOICES = {
                     "article_phrase": article_phrase,
                     "candidates": candidates,
                     "forced_doc_key": "",
+                    "pending_user_text": user_text,  # ✅ نحفظ السؤال الأصلي
                     "ts": datetime.utcnow(),
                 }
+                choices = [
+                    ChoiceOut(label=str(c["original_name"]), doc_key=str(c["doc_key"]))
+                    for c in candidates
+                ]
                 return MessageResponse(
                     id=int(datetime.utcnow().timestamp()),
                     content=(
                         f"لقيت **{article_phrase}** موجودة في أكثر من ملف.\n\n"
-                        "أي ملف تقصد؟ اختر رقم أو اكتب اسم الملف:\n"
-                        + "\n".join(lines)
+                        "أي ملف تقصد؟"
                     ),
                     sender="assistant",
                     timestamp=datetime.utcnow(),
                     sources=[],
                     attachments=[],
+                    choices=choices,
                 )
 
             best_doc_key = _pick_best_doc_key_from_hits(filtered_article_hits) or _pick_best_doc_key_from_hits(broad_hits)
@@ -767,8 +835,12 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         max_sources=int(os.getenv("MAX_SOURCES", "4")),
     )
 
+    # نظّف forced_doc_key بعد ما نستخدمه
     if PENDING_CHOICES.get("forced_doc_key"):
         PENDING_CHOICES["forced_doc_key"] = ""
+    if PENDING_CHOICES.get("pending_user_text"):
+        # نخليه فاضي عشان ما يأثر على أسئلة جديدة
+        PENDING_CHOICES["pending_user_text"] = ""
 
     return MessageResponse(
         id=int(datetime.utcnow().timestamp()),
@@ -777,11 +849,13 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         timestamp=datetime.utcnow(),
         sources=sources,
         attachments=[],
+        choices=[],
     )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         app,
         host=os.getenv("HOST", "0.0.0.0"),

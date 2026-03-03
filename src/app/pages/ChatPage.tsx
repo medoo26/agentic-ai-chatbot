@@ -11,13 +11,16 @@ import remarkGfm from "remark-gfm";
 // ✅ API
 import { apiPost, API_BASE_URL } from "../../api";
 
-
-
 type Attachment = {
   name: string;
   url: string; // غالباً تجي "/api/files/123"
   mime?: string;
   size_mb?: number;
+};
+
+type ChoiceItem = {
+  label: string;   // اسم الملف الظاهر
+  doc_key: string; // doc_key الحقيقي للفلترة
 };
 
 type ApiMessage = {
@@ -27,6 +30,9 @@ type ApiMessage = {
   timestamp: string;
   sources?: string[];
   attachments?: Attachment[];
+
+  // ✅ NEW: خيارات اختيار المصدر
+  choices?: ChoiceItem[];
 };
 
 type UIMessage = {
@@ -36,6 +42,7 @@ type UIMessage = {
   timestamp: Date;
   sources?: string[];
   attachments?: Attachment[];
+  choices?: ChoiceItem[];
 };
 
 export function ChatPage() {
@@ -44,6 +51,9 @@ export function ChatPage() {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [inputMessage, setInputMessage] = useState("");
   const [sending, setSending] = useState(false);
+
+  // ✅ لمنع سبام الضغط على أكثر من خيار بسرعة
+  const [choosing, setChoosing] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -62,8 +72,16 @@ export function ChatPage() {
     setInputMessage("");
   };
 
+  // ✅ Helper لبناء رابط كامل للتحميل
+  const toAbsoluteUrl = (url: string) => {
+    if (!url) return "";
+    if (/^https?:\/\//i.test(url)) return url;
+    return `${API_BASE_URL}${url.startsWith("/") ? url : `/${url}`}`;
+  };
+
+  // ✅ إرسال رسالة عادية
   const sendMessage = async (content: string) => {
-    if (!content.trim() || sending) return;
+    if (!content.trim() || sending || choosing) return;
     setSending(true);
 
     const userMsg: UIMessage = {
@@ -73,6 +91,7 @@ export function ChatPage() {
       timestamp: new Date(),
       sources: [],
       attachments: [],
+      choices: [],
     };
 
     setMessages((prev) => [...prev, userMsg]);
@@ -88,6 +107,7 @@ export function ChatPage() {
         timestamp: new Date(ai.timestamp),
         sources: ai.sources || [],
         attachments: Array.isArray(ai.attachments) ? ai.attachments : [],
+        choices: Array.isArray(ai.choices) ? ai.choices : [],
       };
 
       setMessages((prev) => [...prev, aiMsg]);
@@ -99,6 +119,7 @@ export function ChatPage() {
         timestamp: new Date(),
         sources: [],
         attachments: [],
+        choices: [],
       };
       setMessages((prev) => [...prev, errMsg]);
     } finally {
@@ -106,11 +127,56 @@ export function ChatPage() {
     }
   };
 
-  // ✅ Helper لبناء رابط كامل للتحميل
-  const toAbsoluteUrl = (url: string) => {
-    if (!url) return "";
-    if (/^https?:\/\//i.test(url)) return url;
-    return `${API_BASE_URL}${url.startsWith("/") ? url : `/${url}`}`;
+  // ✅ إرسال اختيار مصدر (زر)
+  // الفكرة: نرسل content للعرض + choice_doc_key للباكند
+  const sendChoice = async (label: string, doc_key: string) => {
+    if (!label || !doc_key || sending || choosing) return;
+
+    setChoosing(true);
+
+    // (اختياري) نعرض اختيارك كفقاعة مستخدم صغيرة
+    const userMsg: UIMessage = {
+      id: `u-choice-${Date.now()}`,
+      content: label,
+      sender: "user",
+      timestamp: new Date(),
+      sources: [],
+      attachments: [],
+      choices: [],
+    };
+    setMessages((prev) => [...prev, userMsg]);
+
+    try {
+      const ai = await apiPost<ApiMessage>("/api/chat", {
+        content: label,
+        choice_doc_key: doc_key, // ✅ مهم
+      });
+
+      const aiMsg: UIMessage = {
+        id: `a-${ai.id}-${Date.now()}`,
+        content: ai.content,
+        sender: ai.sender,
+        timestamp: new Date(ai.timestamp),
+        sources: ai.sources || [],
+        attachments: Array.isArray(ai.attachments) ? ai.attachments : [],
+        choices: Array.isArray(ai.choices) ? ai.choices : [],
+      };
+
+      setMessages((prev) => [...prev, aiMsg]);
+    } catch (err: any) {
+      const errMsg: UIMessage = {
+        id: `err-${Date.now()}`,
+        content: `صار خطأ: ${err?.message || "غير معروف"}`,
+        sender: "assistant",
+        timestamp: new Date(),
+        sources: [],
+        attachments: [],
+        choices: [],
+      };
+      setMessages((prev) => [...prev, errMsg]);
+    } finally {
+      setChoosing(false);
+    }
   };
 
   return (
@@ -173,7 +239,6 @@ export function ChatPage() {
                   m.sender === "user" ? "justify-end" : "justify-start"
                 }`}
               >
-                {/* ✅ فقاعة: خليها w-fit عشان ما تتمدد بدون سبب */}
                 <div
                   className={`w-fit max-w-[85%] sm:max-w-[70%] rounded-2xl p-4 break-words whitespace-pre-wrap ${
                     m.sender === "user"
@@ -215,7 +280,39 @@ export function ChatPage() {
                     </p>
                   )}
 
-                  {/* ✅ Attachments (FIXED): ما عاد فيها justify-between اللي يمد الفقاعة */}
+                  {/* ✅ خيارات اختيار المصدر كأزرار */}
+                  {m.sender === "assistant" &&
+                    Array.isArray(m.choices) &&
+                    m.choices.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-gray-200">
+                        <p className="text-xs font-semibold text-gray-600 mb-2">
+                         : اختر ملف 
+                        </p>
+
+                        <div className="flex flex-col gap-2">
+                          {m.choices.map((c) => (
+                            <Button
+                              key={c.doc_key}
+                              type="button"
+                              variant="outline"
+                              className="justify-start rounded-xl border-gray-300 bg-white hover:bg-gray-50 text-gray-800"
+                              disabled={choosing || sending}
+                              onClick={() => sendChoice(c.label, c.doc_key)}
+                              title={c.label}
+                            >
+                              {choosing ? (
+                                <span className="ml-2">⏳</span>
+                              ) : (
+                                <span className="ml-2">📄</span>
+                              )}
+                              <span className="truncate">{c.label}</span>
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                  {/* Attachments */}
                   {m.sender === "assistant" &&
                     Array.isArray(m.attachments) &&
                     m.attachments.length > 0 && (
@@ -274,6 +371,7 @@ export function ChatPage() {
                       </div>
                     )}
 
+                  {/* Sources */}
                   {m.sender === "assistant" &&
                     Array.isArray(m.sources) &&
                     m.sources.length > 0 && (
@@ -294,13 +392,6 @@ export function ChatPage() {
                         </div>
                       </div>
                     )}
-
-                  <p
-                    className={`text-xs mt-2 ${
-                      m.sender === "user" ? "text-green-100" : "text-gray-500"
-                    }`}
-                  >
-                  </p>
                 </div>
               </div>
             ))}
@@ -318,12 +409,13 @@ export function ChatPage() {
             onKeyDown={(e) => e.key === "Enter" && sendMessage(inputMessage)}
             placeholder="اكتب رسالتك هنا..."
             className="flex-1 rounded-xl border-gray-300 focus:border-[#2E7D32] focus:ring-[#2E7D32] h-11"
-            disabled={sending}
+            disabled={sending || choosing}
           />
           <Button
             onClick={() => sendMessage(inputMessage)}
             className="bg-[#2E7D32] hover:bg-[#1B5E20] text-white rounded-xl px-6 h-11"
-            disabled={sending}
+            disabled={sending || choosing}
+            title={choosing ? "اختر ملف أولاً" : "إرسال"}
           >
             <Send className="h-5 w-5" />
           </Button>
