@@ -12,7 +12,14 @@ import {
   TableRow,
 } from "../../components/ui/table";
 import { apiDelete, apiGet } from "../../../api";
-import { Upload, Trash2, Loader2, Paperclip, FileText, LogOut } from "lucide-react";
+import {
+  Upload,
+  Trash2,
+  Loader2,
+  Paperclip,
+  FileText,
+  LogOut,
+} from "lucide-react";
 
 type DocumentOut = {
   id: number;
@@ -36,6 +43,18 @@ function formatSize(mb?: number | null) {
   return `${mb.toFixed(2)} MB`;
 }
 
+type UploadResultItem = {
+  filename: string;
+  status: "success" | "exists" | "error";
+  message?: string;
+};
+
+type UploadResponse = {
+  status: "done";
+  count: number;
+  results: UploadResultItem[];
+};
+
 export default function DocumentsPage() {
   const navigate = useNavigate();
 
@@ -43,7 +62,8 @@ export default function DocumentsPage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
-  const [file, setFile] = useState<File | null>(null);
+  // ✅ multiple
+  const [files, setFiles] = useState<File[]>([]);
 
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -68,7 +88,7 @@ export default function DocumentsPage() {
     const t = setTimeout(() => {
       setErr("");
       setMsg("");
-    }, 3000);
+    }, 3500);
     return () => clearTimeout(t);
   }, [err, msg]);
 
@@ -89,9 +109,42 @@ export default function DocumentsPage() {
     loadDocs();
   }, []);
 
-  const uploadDoc = async () => {
-    if (!file) {
-      setErr("اختر ملف أولاً");
+  const clearSelected = () => {
+    setFiles([]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const onPickFiles = (list?: FileList | null) => {
+    const picked = list ? Array.from(list) : [];
+    setFiles(picked);
+  };
+
+  const summarizeUpload = (results: UploadResultItem[]) => {
+    const ok = results.filter((r) => r.status === "success").length;
+    const exists = results.filter((r) => r.status === "exists").length;
+    const bad = results.filter((r) => r.status === "error").length;
+
+    const firstError =
+      results.find((r) => r.status === "error")?.message ||
+      results.find((r) => r.status === "error")?.filename;
+
+    if (bad > 0) {
+      const tail = firstError ? `\nأول خطأ: ${firstError}` : "";
+      return {
+        isError: true,
+        text: `تمت عملية الرفع مع أخطاء.\nنجح: ${ok} | موجود مسبقًا: ${exists} | فشل: ${bad}${tail}`,
+      };
+    }
+
+    return {
+      isError: false,
+      text: `تم رفع الملفات ✅\nنجح: ${ok} | موجود مسبقًا: ${exists}`,
+    };
+  };
+
+  const uploadDocs = async () => {
+    if (!files || files.length === 0) {
+      setErr("اختر ملف/ملفات أولاً");
       return;
     }
 
@@ -103,7 +156,8 @@ export default function DocumentsPage() {
       const token = sessionStorage.getItem("adminAuth") || "";
 
       const fd = new FormData();
-      fd.append("file", file);
+      // ✅ IMPORTANT: اسم الحقل لازم يكون "files"
+      files.forEach((f) => fd.append("files", f));
 
       const res = await fetch(`${API_BASE}/api/admin/documents/upload`, {
         method: "POST",
@@ -117,12 +171,25 @@ export default function DocumentsPage() {
       const text = await res.text();
       if (!res.ok) throw new Error(text || `Upload failed (${res.status})`);
 
-      setMsg("تم رفع الملف ✅");
-      setFile(null);
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      let data: UploadResponse | null = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = null;
+      }
+
+      if (data?.results && Array.isArray(data.results)) {
+        const summary = summarizeUpload(data.results);
+        if (summary.isError) setErr(summary.text);
+        else setMsg(summary.text);
+      } else {
+        setMsg("تم رفع الملفات ✅");
+      }
+
+      clearSelected();
       await loadDocs();
     } catch (e: any) {
-      setErr(e?.message || "فشل رفع الملف");
+      setErr(e?.message || "فشل رفع الملفات");
     } finally {
       setBusy(false);
     }
@@ -146,9 +213,16 @@ export default function DocumentsPage() {
     }
   };
 
+  const selectedLabel =
+    files.length === 0
+      ? "اختر ملفات"
+      : files.length === 1
+      ? "تم اختيار ملف"
+      : `تم اختيار ${files.length} ملفات`;
+
   return (
     <div className="min-h-screen bg-gray-50" dir="rtl">
-      {/* ✅ Top Bar (بدل AdminDashboard) */}
+      {/* ✅ Top Bar */}
       <div className="sticky top-0 z-40 bg-white border-b border-gray-200">
         <div className="h-14 px-4 flex items-center justify-between">
           <div className="font-bold text-gray-800">إدارة الملفات</div>
@@ -165,14 +239,13 @@ export default function DocumentsPage() {
         </div>
       </div>
 
-      {/* ✅ محتوى الصفحة */}
       <main className="p-6">
         <div className="space-y-6">
           {/* Toast */}
           {(err || msg) && (
-            <div className="fixed top-4 right-4 z-50">
+            <div className="fixed top-4 right-4 z-50 whitespace-pre-line">
               <div
-                className={`min-w-[260px] max-w-[360px] rounded-xl border px-4 py-3 shadow-lg text-sm flex items-start gap-3 ${
+                className={`min-w-[260px] max-w-[420px] rounded-xl border px-4 py-3 shadow-lg text-sm flex items-start gap-3 ${
                   err
                     ? "bg-red-50 border-red-200 text-red-700"
                     : "bg-green-50 border-green-200 text-green-700"
@@ -198,7 +271,7 @@ export default function DocumentsPage() {
             </div>
           )}
 
-          {/* ✅ Summary Card */}
+          {/* Summary */}
           <Card className="p-4 rounded-2xl">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-8">
@@ -229,9 +302,10 @@ export default function DocumentsPage() {
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple // ✅
                 accept=".pdf,.doc,.docx,.txt"
                 className="hidden"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                onChange={(e) => onPickFiles(e.target.files)}
               />
 
               <div className="flex flex-col gap-2 flex-1 w-full">
@@ -242,24 +316,34 @@ export default function DocumentsPage() {
                 >
                   <span className="flex items-center gap-2 text-gray-700">
                     <Paperclip className="w-5 h-5 text-gray-500" />
-                    {file ? "تم اختيار ملف" : "اختر ملف"}
+                    {selectedLabel}
                   </span>
-                  <span className="text-xs text-gray-500 truncate max-w-[260px]">
-                    {file ? file.name : "PDF / DOCX / TXT"}
+                  <span className="text-xs text-gray-500 truncate max-w-[280px]">
+                    {files.length === 0
+                      ? "PDF / DOCX / TXT"
+                      : files.length === 1
+                      ? files[0].name
+                      : `${files.length} ملفات`}
                   </span>
                 </button>
 
-                {file && (
-                  <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2">
-                    <span className="font-semibold">اسم الملف:</span>{" "}
-                    <span className="break-all">{file.name}</span>
+                {files.length > 0 && (
+                  <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 space-y-1">
+                    <div className="font-semibold">الملفات المختارة:</div>
+                    <div className="max-h-24 overflow-auto pr-1 space-y-0.5">
+                      {files.map((f) => (
+                        <div key={`${f.name}-${f.size}-${f.lastModified}`} className="break-all">
+                          • {f.name}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
 
               <Button
-                onClick={uploadDoc}
-                disabled={!file || busy}
+                onClick={uploadDocs}
+                disabled={files.length === 0 || busy}
                 className="bg-[#2E7D32] hover:bg-[#1B5E20] rounded-xl w-full md:w-auto"
               >
                 {busy ? (
@@ -274,11 +358,8 @@ export default function DocumentsPage() {
                 type="button"
                 variant="outline"
                 className="rounded-xl w-full md:w-auto"
-                onClick={() => {
-                  setFile(null);
-                  if (fileInputRef.current) fileInputRef.current.value = "";
-                }}
-                disabled={!file || busy}
+                onClick={clearSelected}
+                disabled={files.length === 0 || busy}
               >
                 إلغاء
               </Button>

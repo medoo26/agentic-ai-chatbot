@@ -1,3 +1,4 @@
+# main.py
 from __future__ import annotations
 
 import os
@@ -362,87 +363,119 @@ def download_file(public_id: str, db: Session = Depends(get_db)):
 
 
 # =========================================================
-# Upload docs + RAG processing
+# Upload docs + RAG processing  ✅ MULTI FILES
 # =========================================================
 @app.post("/api/admin/documents/upload")
-async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_documents(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
 
-    existing_doc = db.query(Document).filter(Document.name == file.filename).first()
-    if existing_doc:
-        return {"status": "exists", "message": f"الملف '{file.filename}' موجود مسبقًا ولم يتم الحفظ."}
+    results: List[Dict[str, Any]] = []
 
-    file_uuid = uuid.uuid4().hex
-    safe_name = file.filename.replace("\\", "_").replace("/", "_")
-    file_path = os.path.join(upload_dir, f"{file_uuid}_{safe_name}")
+    for file in (files or []):
+        if not file or not (file.filename or "").strip():
+            results.append({"status": "error", "message": "اسم الملف فارغ"})
+            continue
 
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        file_size_bytes = os.path.getsize(file_path)
-        size_str = f"{round(file_size_bytes / (1024 * 1024), 2)} MB"
-
-        new_doc = Document(
-            public_id=uuid.uuid4().hex,
-            name=file.filename,
-            category="جامعة سطام",
-            size=size_str,
-            upload_date=datetime.utcnow(),
-            status="نشط",
-            file_path=file_path,
-        )
-        db.add(new_doc)
-        db.commit()
-
-        result = None
-        processor_error = None
-        try:
-            result = await doc_processor.process_file(file_path)
-        except Exception as e:
-            processor_error = str(e)
-            print("⚠️ Document processing failed (keeping original file):", e)
-
-        if result:
+        existing_doc = db.query(Document).filter(Document.name == file.filename).first()
+        if existing_doc:
+            results.append({
+                "status": "exists",
+                "filename": file.filename,
+                "message": f"الملف '{file.filename}' موجود مسبقًا ولم يتم الحفظ."
+            })
             try:
-                converted_path = (result or {}).get("converted_txt_path")
-                converted_name = (result or {}).get("converted_name")
-                if converted_path and converted_name and os.path.exists(converted_path):
-                    existing_conv = db.query(Document).filter(Document.name == converted_name).first()
-                    if not existing_conv:
-                        size_bytes2 = os.path.getsize(converted_path)
-                        size_str2 = f"{round(size_bytes2 / (1024 * 1024), 2)} MB"
-                        conv_doc = Document(
-                            public_id=uuid.uuid4().hex,
-                            name=converted_name,
-                            category="جامعة سطام (HTML)",
-                            size=size_str2,
-                            upload_date=datetime.utcnow(),
-                            status="نشط",
-                            file_path=converted_path,
-                        )
-                        db.add(conv_doc)
-                        db.commit()
-            except Exception as e:
-                print("⚠️ Failed to save converted HTML doc in DB:", e)
+                await file.close()
+            except Exception:
+                pass
+            continue
 
-        if processor_error:
-            return {
-                "status": "success",
-                "message": f"تم رفع '{file.filename}' ✅ لكن فشل تحويل HTML مؤقتاً: {processor_error}",
-            }
+        file_uuid = uuid.uuid4().hex
+        safe_name = file.filename.replace("\\", "_").replace("/", "_")
+        file_path = os.path.join(upload_dir, f"{file_uuid}_{safe_name}")
 
-        return {"status": "success", "message": f"تم رفع ومعالجة '{file.filename}' بنجاح ✅"}
-
-    except Exception as e:
-        db.rollback()
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            file_size_bytes = os.path.getsize(file_path)
+            size_str = f"{round(file_size_bytes / (1024 * 1024), 2)} MB"
+
+            new_doc = Document(
+                public_id=uuid.uuid4().hex,
+                name=file.filename,
+                category="جامعة سطام",
+                size=size_str,
+                upload_date=datetime.utcnow(),
+                status="نشط",
+                file_path=file_path,
+            )
+            db.add(new_doc)
+            db.commit()
+
+            result = None
+            processor_error = None
+            try:
+                result = await doc_processor.process_file(file_path)
+            except Exception as e:
+                processor_error = str(e)
+                print("⚠️ Document processing failed (keeping original file):", e)
+
+            if result:
+                try:
+                    converted_path = (result or {}).get("converted_txt_path")
+                    converted_name = (result or {}).get("converted_name")
+                    if converted_path and converted_name and os.path.exists(converted_path):
+                        existing_conv = db.query(Document).filter(Document.name == converted_name).first()
+                        if not existing_conv:
+                            size_bytes2 = os.path.getsize(converted_path)
+                            size_str2 = f"{round(size_bytes2 / (1024 * 1024), 2)} MB"
+                            conv_doc = Document(
+                                public_id=uuid.uuid4().hex,
+                                name=converted_name,
+                                category="جامعة سطام (HTML)",
+                                size=size_str2,
+                                upload_date=datetime.utcnow(),
+                                status="نشط",
+                                file_path=converted_path,
+                            )
+                            db.add(conv_doc)
+                            db.commit()
+                except Exception as e:
+                    print("⚠️ Failed to save converted HTML doc in DB:", e)
+
+            if processor_error:
+                results.append({
+                    "status": "success",
+                    "filename": file.filename,
+                    "message": f"تم رفع '{file.filename}' ✅ لكن فشل تحويل HTML مؤقتاً: {processor_error}",
+                })
+            else:
+                results.append({
+                    "status": "success",
+                    "filename": file.filename,
+                    "message": f"تم رفع ومعالجة '{file.filename}' بنجاح ✅",
+                })
+
+        except Exception as e:
+            db.rollback()
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+            results.append({
+                "status": "error",
+                "filename": file.filename,
+                "message": f"خطأ في رفع الملف: {str(e)}"
+            })
+
+        try:
+            await file.close()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"خطأ في رفع الملف: {str(e)}")
+
+    return {"status": "done", "count": len(results), "results": results}
 
 
 # =========================================================
