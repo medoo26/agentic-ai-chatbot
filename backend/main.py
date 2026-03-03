@@ -19,7 +19,8 @@ from sqlalchemy import or_, text
 from admin_api import router as admin_router
 from database import init_db, get_db, AdminUser, Document
 
-from rag_system import RAGSystem, _get_article_variants, _normalize_ar as _rag_normalize_ar
+# ✅ فقط RAGSystem (بدون search_smart / search_article_exact / _get_article_variants)
+from rag_system import RAGSystem
 from llm_service import LLMService
 from document_processor import DocumentProcessor
 
@@ -152,7 +153,6 @@ def _normalize_ar(s: str) -> str:
 # =========================================================
 # ✅ Arabic text helpers
 # =========================================================
-# ✅ يلتقط المادة بكل أشكالها: "المادة 4", "للمادة 4", "للمادة الخامسة", "بمادة 5"
 _RE_ARTICLE_PHRASE = re.compile(
     r"(?:لل|ل|بال|وال|فال)?م[اآ]د[هة]\s+([^\n\.<،,:؛!\?؟]{1,60})",
     re.IGNORECASE,
@@ -179,43 +179,9 @@ def _extract_article_phrase(user_text: str) -> str:
     if not m:
         return ""
     phrase = f"المادة {m.group(1)}"
-    # ✅ قطع عند "من" أو "في" أو "الفصل"
     phrase = re.split(r"\s+(?:من|في|عن|الفصل)\b", phrase)[0].strip()
     phrase = re.sub(r"\s+", " ", phrase).strip()
     return phrase[:60].strip()
-
-
-def _extract_article_no(article_phrase: str) -> str:
-    ap = _fix_ar_spacing(article_phrase)
-    ap = ap.replace("الماده", "المادة").strip()
-    ap = re.sub(r"^\s*المادة\s+", "", ap).strip()
-    ap = ap.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-    return ap[:50].strip()
-
-
-def _merge_hits_unique(hits_a: List[Dict[str, Any]], hits_b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    import hashlib
-    out: List[Dict[str, Any]] = []
-    seen = set()
-    for it in (hits_a or []) + (hits_b or []):
-        meta = it.get("metadata") or {}
-        dk = str(meta.get("doc_key") or "")
-        ci = str(meta.get("chunk_index") or "")
-        h = hashlib.md5((it.get("content") or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
-        key = f"{dk}:{ci}:{h}"
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-
-    def _k(x):
-        sc = x.get("score")
-        if isinstance(sc, (int, float)):
-            return (0, float(sc))
-        return (1, 1e9)
-
-    out.sort(key=_k)
-    return out
 
 
 def _extract_keywords(query: str) -> List[str]:
@@ -239,6 +205,7 @@ def _find_best_document(db: Session, query: str) -> Optional[Document]:
         )
         if doc:
             return doc
+
     keys = _extract_keywords(q)
     if not keys:
         short = q[:20]
@@ -248,6 +215,7 @@ def _find_best_document(db: Session, query: str) -> Optional[Document]:
             .order_by(Document.upload_date.desc())
             .first()
         )
+
     conditions = [Document.name.ilike(f"%{k}%") for k in keys]
     return (
         db.query(Document)
@@ -258,7 +226,7 @@ def _find_best_document(db: Session, query: str) -> Optional[Document]:
 
 
 # =========================================================
-# ✅ Auto-select best doc_key from broad hits
+# ✅ Auto-select best doc_key from hits
 # =========================================================
 def _pick_best_doc_key_from_hits(hits: List[Dict[str, Any]]) -> str:
     if not hits:
@@ -298,7 +266,7 @@ def _pick_best_doc_key_from_hits(hits: List[Dict[str, Any]]) -> str:
 
 
 # =========================================================
-# ✅ Article token helpers
+# ✅ Article token helpers (semantic-only filtering)
 # =========================================================
 def _article_tokens(article_phrase: str) -> List[str]:
     ap = _fix_ar_spacing(article_phrase)
@@ -317,6 +285,7 @@ def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) ->
     toks = _article_tokens(article_phrase)
     if not toks:
         return []
+
     out: List[Dict[str, Any]] = []
     for h in hits:
         meta = h.get("metadata") or {}
@@ -325,6 +294,7 @@ def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) ->
             _normalize_ar(str(meta.get("h3") or "")),
             _normalize_ar(str(h.get("content") or "")),
         ]).strip()
+
         ok = True
         for t in toks:
             if t not in blob:
@@ -332,6 +302,7 @@ def _filter_hits_for_article(hits: List[Dict[str, Any]], article_phrase: str) ->
                 break
         if ok:
             out.append(h)
+
     out.sort(key=lambda x: float(x.get("score", 1e9)) if isinstance(x.get("score"), (int, float)) else 1e9)
     return out
 
@@ -372,169 +343,6 @@ def _pick_candidate_by_name(user_text: str, candidates: List[Dict[str, Any]]) ->
             best = c
             best_len = len(q)
     return best
-
-
-# =========================================================
-# ✅ CORE: Article retrieval — 3-layer strategy
-#
-# Layer 1: search_article_exact() — metadata exact match (NEW)
-# Layer 2: semantic search + smart_where filter (NEW)
-# Layer 3: OLD h2/article_high_level fallback (backward compat)
-# =========================================================
-def _retrieve_article_context(
-    rag: RAGSystem,
-    article_phrase: str,
-    doc_key: str,
-    wants_exec_rules: bool,
-    top_k_find: int = 60,
-    top_k_section: int = 35,
-) -> List[Dict[str, Any]]:
-    if not rag or not article_phrase:
-        return []
-
-    article_no = _extract_article_no(article_phrase)
-    NEIGHBOR_WINDOW = int(os.getenv("RAG_NEIGHBOR_WINDOW", "2"))
-
-    # ---------------------------------------------------
-    # Layer 1: ✅ Exact metadata match (الأدق والأسرع)
-    # يبحث مباشرة في الـ metadata بكل أشكال رقم المادة
-    # ---------------------------------------------------
-    try:
-        exact_hits = rag.search_article_exact(
-            article_phrase=article_no or article_phrase,
-            doc_key=doc_key or None,
-            top_k=top_k_section,
-            include_neighbors=True,
-            neighbor_window=NEIGHBOR_WINDOW,
-        ) or []
-
-        # فلترة إضافية لو طلب قواعد تنفيذية
-        if exact_hits and wants_exec_rules:
-            exec_hits = [
-                h for h in exact_hits
-                if (h.get("metadata") or {}).get("section_type") == "exec_rules"
-            ]
-            if exec_hits:
-                print(f"✅ Layer 1 (exact+exec_rules): {len(exec_hits)} hits")
-                return exec_hits
-
-        if exact_hits:
-            print(f"✅ Layer 1 (exact match): {len(exact_hits)} hits")
-            return exact_hits
-
-    except Exception as e:
-        print(f"⚠️ search_article_exact error: {e}")
-
-    # ---------------------------------------------------
-    # Layer 2: ✅ Semantic search with smart_where filter
-    # ---------------------------------------------------
-    search_text = (
-        f"{article_phrase} القواعد التنفيذية" if wants_exec_rules
-        else f"{article_phrase} نص المادة"
-    )
-
-    where_new = None
-    conds: List[Dict[str, Any]] = []
-    if doc_key:
-        conds.append({"doc_key": str(doc_key)})
-
-    # ✅ استخدم _get_article_variants للبحث بكل أشكال الرقم
-    if article_no:
-        variants = _get_article_variants(article_no)
-        if variants:
-            or_conds = []
-            for v in variants:
-                v = (v or "").strip()
-                if v:
-                    or_conds.append({"article_no": v})
-                    v_norm = _rag_normalize_ar(v)
-                    if v_norm and v_norm != v:
-                        or_conds.append({"article_no_norm": v_norm})
-            if or_conds:
-                conds.append({"$or": or_conds})
-
-    if wants_exec_rules and article_no:
-        conds.append({"section_type": "exec_rules"})
-
-    if conds:
-        where_new = conds[0] if len(conds) == 1 else {"$and": conds}
-
-    try:
-        new_hits = rag.search(
-            search_text,
-            top_k=top_k_section,
-            include_neighbors=True,
-            neighbor_window=NEIGHBOR_WINDOW,
-            where=where_new,
-        ) or []
-        if new_hits:
-            print(f"✅ Layer 2 (semantic+smart_where): {len(new_hits)} hits")
-            return new_hits
-    except Exception as e:
-        print(f"⚠️ Layer 2 search error: {e}")
-
-    # ---------------------------------------------------
-    # Layer 3: OLD h2/article_high_level fallback
-    # للملفات المرفوعة قبل إضافة article_no في الـ metadata
-    # ---------------------------------------------------
-    where_find = None
-    if doc_key:
-        where_find = {"$and": [{"doc_key": str(doc_key)}, {"chunk_type": "article_high_level"}]}
-    else:
-        where_find = {"chunk_type": "article_high_level"}
-
-    try:
-        hits = rag.search(
-            article_phrase,
-            top_k=top_k_find,
-            include_neighbors=False,
-            neighbor_window=0,
-            where=where_find,
-        ) or []
-    except Exception:
-        hits = []
-
-    toks = _article_tokens(article_phrase)
-    if toks:
-        filtered: List[Dict[str, Any]] = []
-        for h in hits:
-            meta = h.get("metadata") or {}
-            h2 = _normalize_ar(str(meta.get("h2") or ""))
-            content = _normalize_ar(str(h.get("content") or ""))
-            blob = f"{h2} {content}".strip()
-            ok = all(t in blob for t in toks)
-            if ok:
-                filtered.append(h)
-        hits = filtered
-
-    if not hits:
-        print("⚠️ All 3 layers returned nothing")
-        return []
-
-    hits.sort(key=lambda x: float(x.get("score", 1e9)) if isinstance(x.get("score"), (int, float)) else 1e9)
-    best = hits[0]
-    best_meta = best.get("metadata") or {}
-    best_h2 = str(best_meta.get("h2") or "").strip()
-
-    if not best_h2:
-        print(f"✅ Layer 3 (h2 fallback, no h2): {min(12, len(hits))} hits")
-        return hits[: min(12, len(hits))]
-
-    where_sec = {"$and": [{"doc_key": str(doc_key)}, {"h2": best_h2}]}
-    try:
-        sec_hits = rag.search(
-            article_phrase,
-            top_k=top_k_section,
-            include_neighbors=True,
-            neighbor_window=NEIGHBOR_WINDOW,
-            where=where_sec,
-        ) or []
-    except Exception:
-        sec_hits = []
-
-    out = _merge_hits_unique(sec_hits, hits[:5])
-    print(f"✅ Layer 3 (h2 fallback): {len(out)} hits")
-    return out
 
 
 # =========================================================
@@ -739,7 +547,6 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     refined_question = (refined.get("refined_question") or user_text).strip()
     intent = (refined.get("intent") or "").strip()
 
-    # ✅ استخدم build_retrieval_query_smart (يضيف رقم المادة صراحةً)
     retrieval_query = llm_service.build_retrieval_query_smart(refined, user_text)
     retrieval_query = _fix_ar_spacing(retrieval_query)
 
@@ -766,140 +573,95 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         print("🧠 LAST_TOPIC updated:", LAST_TOPIC)
 
     # -------------------------------------------------
-    # ✅ Search config
+    # ✅ Search config (semantic only)
     # -------------------------------------------------
     BROAD_TOP_K = int(os.getenv("RAG_BROAD_TOP_K", "40"))
     FOCUSED_TOP_K = int(os.getenv("RAG_FOCUSED_TOP_K", "10"))
     NEIGHBOR_WINDOW = int(os.getenv("RAG_NEIGHBOR_WINDOW", "2"))
     DIST_THRESHOLD = float(os.getenv("RAG_DISTANCE_THRESHOLD", "0.95"))
 
-    # -------------------------------------------------
-    # ✅ If article request → skip broad search, use search_smart directly
-    # -------------------------------------------------
     context_docs: List[Dict[str, Any]] = []
     broad_hits: List[Dict[str, Any]] = []
     best_doc_key = ""
 
-    forced_doc_key2 = str((PENDING_CHOICES or {}).get("forced_doc_key") or "").strip()
+    forced_doc_key2 = str((PENDING_CHOICES or {}).get("forced_doc_key") or "").strip() or forced_doc_key
 
+    # =========================================================
+    # ✅ SEMANTIC ONLY FLOW
+    # - broad semantic to guess doc_key
+    # - focused semantic with doc_key filter
+    # - optional article filtering
+    # =========================================================
+    try:
+        broad_hits = rag_system.search(
+            retrieval_query,
+            top_k=BROAD_TOP_K,
+            include_neighbors=False,
+            neighbor_window=0,
+        ) or []
+    except Exception as e:
+        print("RAG broad search error:", e)
+        broad_hits = []
+
+    # إذا سؤال مادة: فلترة broad hits بالمادة ثم قرر doc_key
     if article_phrase:
-        # ✅ استخدم search_smart أولاً للمادة (exact match + fallback semantic)
-        article_no = _extract_article_no(article_phrase)
-        smart_doc_key = forced_doc_key2 or ""
-
-        try:
-            smart_hits = rag_system.search_smart(
-                query=retrieval_query,
-                top_k=FOCUSED_TOP_K,
-                doc_key=smart_doc_key or None,
-                include_neighbors=True,
-                neighbor_window=NEIGHBOR_WINDOW,
-            ) or []
-        except Exception as e:
-            print(f"⚠️ search_smart error: {e}")
-            smart_hits = []
-
-        if smart_hits:
-            # فلترة: تأكد أن النتائج تحتوي على رقم المادة الصحيح
-            filtered = _filter_hits_for_article(smart_hits, article_phrase)
-            if filtered:
-                context_docs = filtered
-                best_doc_key = str((filtered[0].get("metadata") or {}).get("doc_key") or "").strip()
-                print(f"✅ search_smart exact: {len(context_docs)} hits, doc_key={best_doc_key}")
-
-        # لو search_smart ما لقى شيء → fallback للـ 3-layer strategy
-        if not context_docs:
-            # 1) broad search لتحديد الملف
-            try:
-                broad_hits = rag_system.search(
-                    retrieval_query,
-                    top_k=BROAD_TOP_K,
-                    include_neighbors=False,
-                    neighbor_window=0,
-                ) or []
-            except Exception as e:
-                print("RAG broad search error:", e)
-                broad_hits = []
-
-            if forced_doc_key2:
-                best_doc_key = forced_doc_key2
-            else:
-                filtered_article_hits = _filter_hits_for_article(broad_hits, article_phrase)
-                candidates = _rank_doc_candidates_from_hits(filtered_article_hits, top_n=6)
-
-                # ✅ إذا أكثر من ملف → اسأل المستخدم
-                if len(candidates) >= 2 and not best_doc_key:
-                    lines = [f"{i}) {c['original_name']}" for i, c in enumerate(candidates, start=1)]
-                    LAST_TOPIC = f"{article_phrase}::choose_doc"
-                    PENDING_CHOICES = {
-                        "article_phrase": article_phrase,
-                        "candidates": candidates,
-                        "forced_doc_key": "",
-                        "ts": datetime.utcnow(),
-                    }
-                    return MessageResponse(
-                        id=int(datetime.utcnow().timestamp()),
-                        content=(
-                            f"لقيت **{article_phrase}** موجودة في أكثر من ملف.\n\n"
-                            "أي ملف تقصد؟ اختر رقم أو اكتب اسم الملف:\n"
-                            + "\n".join(lines)
-                        ),
-                        sender="assistant",
-                        timestamp=datetime.utcnow(),
-                        sources=[],
-                        attachments=[],
-                    )
-
-                best_doc_key = _pick_best_doc_key_from_hits(filtered_article_hits) or _pick_best_doc_key_from_hits(broad_hits)
-
-            # 2) 3-layer article retrieval
-            context_docs = _retrieve_article_context(
-                rag=rag_system,
-                article_phrase=article_phrase,
-                doc_key=best_doc_key,
-                wants_exec_rules=wants_exec_rules,
-                top_k_find=60,
-                top_k_section=35,
-            ) or []
-
-    else:
-        # =========================================================
-        # ✅ Non-article query: broad search + focused
-        # =========================================================
-        try:
-            broad_hits = rag_system.search(
-                retrieval_query,
-                top_k=BROAD_TOP_K,
-                include_neighbors=False,
-                neighbor_window=0,
-            ) or []
-        except Exception as e:
-            print("RAG broad search error:", e)
-            broad_hits = []
+        filtered_article_hits = _filter_hits_for_article(broad_hits, article_phrase)
+        candidates = _rank_doc_candidates_from_hits(filtered_article_hits, top_n=6)
 
         if forced_doc_key2:
             best_doc_key = forced_doc_key2
         else:
-            best_doc_key = _pick_best_doc_key_from_hits(broad_hits)
+            # ✅ إذا أكثر من ملف → اسأل المستخدم
+            if len(candidates) >= 2:
+                lines = [f"{i}) {c['original_name']}" for i, c in enumerate(candidates, start=1)]
+                LAST_TOPIC = f"{article_phrase}::choose_doc"
+                PENDING_CHOICES = {
+                    "article_phrase": article_phrase,
+                    "candidates": candidates,
+                    "forced_doc_key": "",
+                    "ts": datetime.utcnow(),
+                }
+                return MessageResponse(
+                    id=int(datetime.utcnow().timestamp()),
+                    content=(
+                        f"لقيت **{article_phrase}** موجودة في أكثر من ملف.\n\n"
+                        "أي ملف تقصد؟ اختر رقم أو اكتب اسم الملف:\n"
+                        + "\n".join(lines)
+                    ),
+                    sender="assistant",
+                    timestamp=datetime.utcnow(),
+                    sources=[],
+                    attachments=[],
+                )
 
-        if best_doc_key:
-            print("🎯 Auto-selected doc_key:", best_doc_key)
+            best_doc_key = _pick_best_doc_key_from_hits(filtered_article_hits) or _pick_best_doc_key_from_hits(broad_hits)
 
-        try:
-            context_docs = rag_system.search(
-                retrieval_query,
-                top_k=FOCUSED_TOP_K,
-                include_neighbors=True,
-                neighbor_window=NEIGHBOR_WINDOW,
-                where={"doc_key": best_doc_key} if best_doc_key else None,
-            ) or []
-        except Exception as e:
-            print("RAG search error:", e)
-            context_docs = []
+    else:
+        best_doc_key = forced_doc_key2 or _pick_best_doc_key_from_hits(broad_hits)
 
-    # -------------------------------------------------
-    # Fallback: broad → focused بدون doc_key فلتر
-    # -------------------------------------------------
+    if best_doc_key:
+        print("🎯 Auto-selected doc_key:", best_doc_key)
+
+    # Focused semantic search
+    try:
+        context_docs = rag_system.search(
+            retrieval_query,
+            top_k=FOCUSED_TOP_K,
+            include_neighbors=True,
+            neighbor_window=NEIGHBOR_WINDOW,
+            where={"doc_key": best_doc_key} if best_doc_key else None,
+        ) or []
+    except Exception as e:
+        print("RAG focused search error:", e)
+        context_docs = []
+
+    # Article filter on focused results (semantic-only reinforcement)
+    if article_phrase and context_docs:
+        filtered2 = _filter_hits_for_article(context_docs, article_phrase)
+        if filtered2:
+            context_docs = filtered2
+
+    # Fallback: focused without doc_key
     if not context_docs and broad_hits:
         try:
             context_docs = rag_system.search(
@@ -912,7 +674,12 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
             print("RAG fallback search error:", e)
             context_docs = []
 
-    # ✅ Threshold gate (لا نطبقه على أسئلة المواد)
+        if article_phrase and context_docs:
+            filtered3 = _filter_hits_for_article(context_docs, article_phrase)
+            if filtered3:
+                context_docs = filtered3
+
+    # Threshold gate (لا نطبقه على أسئلة المواد)
     best_score = None
     for d in context_docs:
         sc = d.get("score")

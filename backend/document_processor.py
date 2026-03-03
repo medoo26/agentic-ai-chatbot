@@ -24,14 +24,14 @@ class DocumentProcessor:
         self.processed_html_dir = Path(processed_dir)
         self.processed_html_dir.mkdir(parents=True, exist_ok=True)
 
-        # HTML chunking settings (fallback only)
+        # Chunking settings (for indexing only)
         self.chunk_size = int(os.getenv("HTML_CHUNK_SIZE", "1800"))
         self.chunk_overlap = int(os.getenv("HTML_CHUNK_OVERLAP", "350"))
 
         # LLM conversion protection
         self.html_llm_timeout = int(os.getenv("HTML_LLM_TIMEOUT", "60"))
 
-        # ✅ حد نهائي كبير فقط
+        # final hard cap
         self.html_hard_max_chars = int(os.getenv("HTML_HARD_MAX_CHARS", "250000"))
 
         # Segment large docs for LLM conversion
@@ -78,7 +78,7 @@ class DocumentProcessor:
         return str(out_path), out_name
 
     # =========================================================
-    # ✅ Split long raw text into segments for LLM conversion
+    # Split long raw text into segments for LLM conversion
     # =========================================================
     def _split_text_segments(self, text: str) -> List[str]:
         t = (text or "").strip()
@@ -102,7 +102,7 @@ class DocumentProcessor:
         return out
 
     # =========================================================
-    # ✅ Robust HTML body extraction (prevents multiple doctypes)
+    # Robust HTML body extraction (prevents multiple doctypes)
     # =========================================================
     def _strip_outer_html(self, html: str) -> str:
         h = (html or "").strip()
@@ -143,7 +143,7 @@ class DocumentProcessor:
 """.strip()
 
     # =========================================================
-    # ✅ HTML -> plain text (for embeddings)
+    # HTML -> plain text (for embeddings)
     # =========================================================
     def _html_to_plain(self, html: str) -> str:
         x = (html or "").strip()
@@ -158,61 +158,43 @@ class DocumentProcessor:
         return x.strip()
 
     # =========================================================
-    # ✅ Generic HTML split (works for ANY docs)
-    # - If many headings exist, split by headings
-    # - else fallback to Recursive splitter
+    # ✅ Split BODY by H1/H2/H3 only
+    # - This keeps H4 (القواعد التنفيذية) inside the same مادة chunk
+    # - Does NOT edit HTML. Just splits for indexing.
     # =========================================================
-    def _split_html(self, html_doc: str) -> List[str]:
+    def _split_html_by_h123(self, html_doc: str) -> List[str]:
         html_doc = (html_doc or "").strip()
         if not html_doc:
             return []
 
         body = self._strip_outer_html(html_doc)
+        if not body:
+            return []
 
-        # split by headings if present
-        heading_pat = re.compile(r"(?is)(<h[1-6]\b[^>]*>.*?</h[1-6]\s*>)")
-        parts = heading_pat.split(body)
-
-        chunks: List[str] = []
+        # Split markers: ONLY h1/h2/h3
+        split_pat = re.compile(r"(?is)(<h[1-3]\b[^>]*>.*?</h[1-3]\s*>)")
+        parts = split_pat.split(body)
 
         # parts: [before, h, after, h, after ...]
-        if len(parts) > 1:
-            before = (parts[0] or "").strip()
-            if before:
-                chunks.append(before)
+        blocks: List[str] = []
+        if len(parts) == 1:
+            # no h1/h2/h3 at all -> return as one
+            return [body.strip()] if body.strip() else []
 
-            i = 1
-            while i < len(parts) - 1:
-                h = (parts[i] or "").strip()
-                b = (parts[i + 1] or "").strip()
-                block = (h + "\n" + b).strip()
-                if block:
-                    chunks.append(block)
-                i += 2
+        before = (parts[0] or "").strip()
+        if before:
+            blocks.append(before)
 
-            # if splitting produced enough segments, keep it
-            if len(chunks) >= 5:
-                return self._merge_tiny_text_chunks(chunks)
+        i = 1
+        while i < len(parts) - 1:
+            h = (parts[i] or "").strip()
+            b = (parts[i + 1] or "").strip()
+            block = (h + "\n" + b).strip()
+            if block:
+                blocks.append(block)
+            i += 2
 
-        # fallback: langchain splitter
-        chunks2: List[str] = []
-        try:
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=self.chunk_size,
-                chunk_overlap=self.chunk_overlap,
-                separators=["\n\n", "\n", "• ", "- ", "؛", "؟", "!", ".", "،", " ", ""],
-            )
-            chunks2 = [c.strip() for c in splitter.split_text(body) if (c or "").strip()]
-        except Exception:
-            step = max(1, self.chunk_size - self.chunk_overlap)
-            for j in range(0, len(body), step):
-                part = body[j : j + self.chunk_size].strip()
-                if part:
-                    chunks2.append(part)
-
-        return self._merge_tiny_text_chunks(chunks2)
+        return self._merge_tiny_text_chunks(blocks)
 
     def _merge_tiny_text_chunks(self, chunks: List[str]) -> List[str]:
         merged: List[str] = []
@@ -324,15 +306,17 @@ class DocumentProcessor:
                     "تأكد من تعديل llm_service.py وتمريره هنا."
                 )
 
-            # ✅ حماية نهائية فقط
+            # hard cap
             if len(raw_text_for_llm) > self.html_hard_max_chars:
                 raw_text_for_llm = raw_text_for_llm[: self.html_hard_max_chars]
                 print(f"✂️ Truncated raw text to {len(raw_text_for_llm)} chars (HTML_HARD_MAX_CHARS)")
 
             segments = self._split_text_segments(raw_text_for_llm)
-            print(f"🧩 HTML convert segments={len(segments)} total_chars={len(raw_text_for_llm)} timeout={self.html_llm_timeout}s")
+            print(
+                f"🧩 HTML convert segments={len(segments)} total_chars={len(raw_text_for_llm)} timeout={self.html_llm_timeout}s"
+            )
 
-            # ✅ اجمع BODY فقط من كل segment (بدون doctype/html/head)
+            # collect BODY only from each segment
             body_parts: List[str] = []
             save_name = original_name or stored_filename
 
@@ -340,6 +324,7 @@ class DocumentProcessor:
                 seg = (seg or "").strip()
                 if not seg:
                     continue
+
                 print(f"🚀 Segment {si}/{len(segments)} chars={len(seg)}")
 
                 try:
@@ -360,23 +345,22 @@ class DocumentProcessor:
                 print("⚠️ LLM رجّع HTML فارغ")
                 return {"html": "", "converted_txt_path": "", "converted_name": ""}
 
-            # ✅ وثيقة HTML واحدة فقط
+            # single HTML doc
             html = self._wrap_html_document(body_inner_all, title=save_name)
 
             converted_txt_path, converted_name = self._save_converted_html_as_txt(save_name, html)
 
-            # ✅ chunking من HTML واحد
-            chunks_html = self._split_html(html)
+            # ✅ split for indexing by H1/H2/H3 only (keeps H4 inside)
+            chunks_html = self._split_html_by_h123(html)
             print(f"🧩 HTML chunks produced: {len(chunks_html)}")
 
             if not chunks_html:
                 return {"html": html, "converted_txt_path": converted_txt_path, "converted_name": converted_name}
 
+            # delete old chunks
             self._delete_existing_index(doc_key)
 
-            # ✅ IMPORTANT:
-            # نفهرس "نص" عشان يجاوب حتى لو المعلومة في <p>
-            # ونحفظ HTML للعرض داخل metadata
+            # index plain text + keep chunk html in metadata for UI preview
             if self.rag_system:
                 for idx, chunk_html in enumerate(chunks_html, start=0):
                     chunk_html = (chunk_html or "").strip()
@@ -393,12 +377,10 @@ class DocumentProcessor:
                     chunk_meta["converted_file"] = converted_txt_path
                     chunk_meta["skip_chunking"] = True
                     chunk_meta["chunk_index"] = int(idx)
-
-                    # ✅ store HTML for UI preview (optional)
-                    chunk_meta["html"] = chunk_html
+                    chunk_meta["html"] = chunk_html  # optional: show exact HTML chunk
 
                     self.rag_system.add_document(
-                        content=chunk_plain,   # ✅ indexed content
+                        content=chunk_plain,
                         metadata=chunk_meta,
                         document_id=chunk_id,
                     )

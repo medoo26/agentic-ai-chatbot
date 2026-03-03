@@ -298,7 +298,6 @@ class LLMService:
         if not m:
             return ""
         phrase = "المادة " + (m.group(1) or "").strip()
-        # ✅ قطع عند "من" أو "في" أو "الفصل"
         phrase = re.split(r"\s+(?:من|في|عن|الفصل)\b", phrase)[0].strip()
         phrase = re.sub(r"\s+", " ", phrase).strip()
         return phrase[:80]
@@ -397,7 +396,7 @@ class LLMService:
         return ""
 
     # -----------------------------------------------------
-    # ✅ HTML post-process
+    # ✅ HTML helper (strip code fences only)
     # -----------------------------------------------------
     def _strip_code_fences(self, text: str) -> str:
         t = (text or "").strip()
@@ -405,50 +404,6 @@ class LLMService:
         if m:
             return (m.group(1) or "").strip()
         return t
-
-    def _extract_body_inner(self, html_doc: str) -> str:
-        html_doc = (html_doc or "").strip()
-        m = re.search(r"<body\b[^>]*>(.*?)</body>", html_doc, flags=re.IGNORECASE | re.DOTALL)
-        return (m.group(1) if m else html_doc).strip()
-
-    def _ensure_valid_html_document(self, html_or_fragment: str, title: str) -> str:
-        title = (title or "Document").strip() or "Document"
-        frag = (html_or_fragment or "").strip()
-        body_inner = self._extract_body_inner(frag)
-        out = f"""<!doctype html>
-<html lang="ar">
-<head>
-  <meta charset="utf-8">
-  <title>{self._safe_str(title)}</title>
-</head>
-<body>
-{body_inner}
-</body>
-</html>
-""".strip()
-        return out
-
-    def _sanitize_html_allowed_tags(self, html_doc: str) -> str:
-        html_doc = (html_doc or "").strip()
-        if not html_doc:
-            return ""
-        html_doc = re.sub(r"<script\b.*?</script>", " ", html_doc, flags=re.IGNORECASE | re.DOTALL)
-        html_doc = re.sub(r"<style\b.*?</style>", " ", html_doc, flags=re.IGNORECASE | re.DOTALL)
-        html_doc = re.sub(r"<!--.*?-->", " ", html_doc, flags=re.DOTALL)
-        allowed = {
-            "html", "head", "meta", "title", "body",
-            "h2", "h3", "h4", "p",
-            "table", "thead", "tbody", "tr", "th", "td"
-        }
-        def _tag_repl(m):
-            tag = (m.group(1) or "").lower()
-            if tag in allowed:
-                return m.group(0)
-            return " "
-        html_doc = re.sub(r"</?\s*([a-zA-Z0-9]+)\b[^>]*>", _tag_repl, html_doc)
-        html_doc = re.sub(r"[ \t]+", " ", html_doc)
-        html_doc = re.sub(r"\n{3,}", "\n\n", html_doc).strip()
-        return html_doc
 
     # -----------------------------------------------------
     # ✅ Refiner Prompt
@@ -632,39 +587,53 @@ refined_question, intent, entities, constraints, search_queries, needs_clarifica
         return (refined.get("refined_question", "") or "").strip()
 
     # -----------------------------------------------------
-    # ✅ HTML conversion
+    # ✅ HTML conversion (NO postprocess fixes after LLM)
     # -----------------------------------------------------
     def to_structured_html(self, raw_text: str, file_title: Optional[str] = None) -> str:
         raw_text = (raw_text or "").strip()
         if not raw_text:
             return ""
+
         title = (file_title or "Document").strip() or "Document"
         has_md_table = bool(self._RE_MD_TABLE.search(raw_text))
+
         rules_extra = ""
         if has_md_table:
-            rules_extra = "\n- إذا وجدت جدول بصيغة Markdown (علامة | وخط ---) لازم تحوله إلى <table> (thead/tbody/tr/th/td)."
+            rules_extra = (
+                "\n- إذا وجدت جدول بصيغة Markdown (علامة | وخط ---) لازم تحوله إلى "
+                "<table><thead><tbody><tr><th><td> بشكل صحيح."
+            )
 
         prompt = f"""
-حوّل المحتوى التالي إلى **وثيقة HTML كاملة وصحيحة (Valid HTML Document)**.
+أنت محوّل نص إلى HTML عربي.
 
-FILE_NAME_TITLE (مهم جدًا): {title}
+مهم جدًا: أعد **وثيقة HTML كاملة وصحيحة** فقط. ممنوع أي شرح أو Markdown أو ```.
 
-قواعد إلزامية (لا تخالفها):
-1) أعد **HTML فقط** بدون أي شرح أو نص خارج HTML أو Markdown.
+FILE_NAME_TITLE: {title}
+
+❗قواعد إلزامية (لا تخالفها):
+1) أعد HTML فقط (بدون أي نص خارج HTML).
 2) لازم تبدأ بـ: <!doctype html>
-3) لازم تحتوي على الترتيب التالي:
-   <html lang="ar"> ثم <head> ثم <meta charset="utf-8"> ثم <title> ثم </head> ثم <body> ثم المحتوى ثم </body> ثم </html>
-4) <title> لازم يكون مطابق لـ FILE_NAME_TITLE حرفيًا.
-5) داخل <body> استخدم فقط هذه التاقات:
-   <h2>, <h3>, <h4>, <p>, <table>, <thead>, <tbody>, <tr>, <th>, <td>
-6) ممنوع أي تاقات أخرى (مثل div/span/a/img/script/style).
-7) لا تنشئ <table> إلا إذا كان هناك جدول واضح (صفوف/أعمدة) أو كان النص واضح أنه جدول.
+3) لازم يكون الهيكل حرفيًا بهذا الترتيب:
+   <html lang="ar"><head><meta charset="utf-8"><title>FILE_NAME_TITLE</title></head><body>...content...</body></html>
+4) داخل <body> مسموح فقط بهذه التاقات (ولا غيرها):
+   <h2>, <h3>, <p>, <table>, <thead>, <tbody>, <tr>, <th>, <td>
+   ممنوع: h1/h4/div/span/a/img/br/script/style/ul/ol/li ... إلخ.
+5) كل نص (غير العناوين) لازم يكون داخل <p>. ممنوع نص حر خارج <p>.
+6) أي سطر يبدأ بـ "الفصل" أو "الباب" اجعله عنوان <h2>.
+7) أي سطر يبدأ بـ "المادة" أو "الماده" اجعله عنوان <h3>المادة ...</h3> فقط (ممنوع داخل <p>).
+8) "القواعد التنفيذية للمادة ..." لازم تكون داخل <p> (ممنوع <h4>).
+   مثال: <p>القواعد التنفيذية للمادة الخامسة:</p>
+9) أي نقاط/تعداد مثل:
+   - كذا
+   • كذا
+   1) كذا
+   حوّل كل نقطة إلى <p>نص النقطة</p> (بدون شرطة/رمز في البداية).
+10) لا تدمج مواد مختلفة تحت نفس المادة. كل مادة تبدأ بـ <h3>.
+11) لا تختصر ولا تعيد صياغة. فقط رتب ووسّم النص.
+12) لا تنشئ <table> إلا إذا كان هناك جدول واضح أو Markdown table.
 {rules_extra}
-8) تأكد أن كل التاقات مغلقة بشكل صحيح.
-9) أي سطر يبدأ بكلمة "المادة" أو "الماده" يجب تحويله إلى عنوان: <h3>المادة ...</h3> (ممنوع يكون داخل <p>).
-10) أي سطر يبدأ بـ "القواعد التنفيذية للمادة" يجب تحويله إلى عنوان فرعي داخل المادة: <h4>القواعد التنفيذية للمادة ...</h4>.
-11) أي سطر يبدأ بـ "الفصل" أو "الباب" يكون <h2>.
-12) بقية الفقرات تكون داخل <p>.
+13) تأكد من إغلاق كل التاقات صح 100%.
 
 المحتوى:
 <<<
@@ -672,9 +641,14 @@ FILE_NAME_TITLE (مهم جدًا): {title}
 >>>
 """.strip()
 
-        use_openai = (self.html_provider == "openai") or (not self.html_provider and self.openai_key and self.llm is not None)
+        use_openai = (
+            (self.html_provider == "openai")
+            or (not self.html_provider and self.openai_key and self.llm is not None)
+        )
+
         out = ""
 
+        # OpenAI
         if use_openai and self.openai_key:
             try:
                 llm_html = self._init_openai_chat(
@@ -692,6 +666,7 @@ FILE_NAME_TITLE (مهم جدًا): {title}
             except Exception as e:
                 print("⚠️ OpenAI HTML convert failed:", self._safe_str(e))
 
+        # Gemini
         if not out and self.gemini_ready:
             try:
                 out = self._gemini_generate(
@@ -704,11 +679,9 @@ FILE_NAME_TITLE (مهم جدًا): {title}
                 print("⚠️ Gemini HTML convert failed:", self._safe_str(e))
                 out = ""
 
-        out = self._strip_code_fences(out)
-        out = self._ensure_valid_html_document(out, title)
-        out = self._sanitize_html_allowed_tags(out)
-        out = self._ensure_valid_html_document(out, title)
-        return (out or "").strip()
+        # remove ``` fences if model broke rules
+        out = self._strip_code_fences(out).strip()
+        return out
 
     # -----------------------------------------------------
     # Context + sources
@@ -880,25 +853,16 @@ FILE_NAME_TITLE (مهم جدًا): {title}
 
     # -----------------------------------------------------
     # ✅ build_retrieval_query_smart
-    # الجديد: يضيف article_phrase في الـ query لمساعدة RAG
     # -----------------------------------------------------
     def build_retrieval_query_smart(self, refined: Dict[str, Any], user_query: str = "") -> str:
-        """
-        ✅ يبني query محسّن للـ RAG يضمن أن رقم المادة واضح في الـ query.
-        استخدمه بدل build_retrieval_query في main.py/chatbot.
-        """
         rq = (refined.get("refined_question") or user_query or "").strip()
-
-        # إذا فيه طلب مادة، نضيف نص المادة بوضوح في الـ query
         article_phrase = self._extract_article_phrase(rq)
         wants_rules = self._is_exec_rules_query(rq)
-
         base_query = self.build_retrieval_query(refined)
 
         if not article_phrase:
             return base_query
 
-        # نبني retrieval query واضح يتضمن رقم المادة + نوع الطلب
         if wants_rules:
             retrieval_query = f"{base_query} {article_phrase} نص القواعد التنفيذية"
         else:
@@ -975,7 +939,6 @@ FILE_NAME_TITLE (مهم جدًا): {title}
             direct = self._extract_requested_article_only(rq, context_docs or [])
             if direct:
                 return self.append_sources_to_answer(direct, context_docs or [])
-            # ✅ لا توقف هنا — كمّل للـ LLM (قد يكون السياق يحتوي على المادة بصيغة مختلفة)
 
         # ✅ 3) جدول مباشر
         direct_table = self._should_return_table_directly(context_docs or [])
@@ -991,7 +954,6 @@ FILE_NAME_TITLE (مهم جدًا): {title}
         role_line = f"دور المستخدم: {user_role}".strip()
         intent_line = f"نوع الطلب: {intent}".strip() if intent else "نوع الطلب: غير محدد"
 
-        # ✅ إذا طلب مادة، نعطي LLM تعليمات خاصة لإخراج المادة فقط
         article_extra = ""
         if self._is_article_request(rq):
             article_phrase = self._extract_article_phrase(rq)
@@ -1063,4 +1025,4 @@ FILE_NAME_TITLE (مهم جدًا): {title}
             return self.append_sources_to_answer(ans, context_docs or [])
 
     def is_available(self) -> bool:
-        return (self.llm is not None) or self.gemini_ready
+        return (self.llm is not None) or bool(self.gemini_ready)
