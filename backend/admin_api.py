@@ -64,7 +64,6 @@ def parse_size_to_mb(size: Optional[str]) -> Optional[float]:
             return round(num / 1024.0, 2)
         if unit in ("gb", "gib"):
             return round(num * 1024.0, 2)
-        # لو كانت بدون وحدة، نعتبرها MB
         return round(num, 2)
     except Exception:
         return None
@@ -101,6 +100,10 @@ class AdminStatsOut(BaseModel):
     active_knowledge_entries: int
     chatbot_available: bool
     last_upload_at: Optional[str] = None
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: List[int]
 
 
 # =========================================================
@@ -172,16 +175,57 @@ def delete_document(
     if not doc:
         raise HTTPException(404, "Document not found")
 
-    # حذف الشنكات المرتبطة
     db.query(DocumentChunk).filter(DocumentChunk.document_id == doc_id).delete(
         synchronize_session=False
     )
 
-    # حذف الملف من الدسك
     removed_file = safe_remove_file(getattr(doc, "file_path", None))
 
-    # حذف السجل
     db.delete(doc)
     db.commit()
 
     return {"ok": True, "id": doc_id, "file_deleted": removed_file}
+
+
+@router.post("/documents/bulk-delete")
+def bulk_delete_documents(
+    payload: BulkDeleteRequest,
+    db: Session = Depends(get_db),
+    _admin: AdminUser = Depends(verify_admin),
+):
+    ids = list(set(payload.ids or []))
+    if not ids:
+        raise HTTPException(status_code=400, detail="لم يتم إرسال أي ملفات للحذف.")
+
+    docs = db.query(Document).filter(Document.id.in_(ids)).all()
+    if not docs:
+        raise HTTPException(status_code=404, detail="لم يتم العثور على الملفات المحددة.")
+
+    deleted_ids: List[int] = []
+    file_deleted_count = 0
+
+    try:
+        for doc in docs:
+            db.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete(
+                synchronize_session=False
+            )
+
+            removed_file = safe_remove_file(getattr(doc, "file_path", None))
+            if removed_file:
+                file_deleted_count += 1
+
+            deleted_ids.append(doc.id)
+            db.delete(doc)
+
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"فشل حذف الملفات: {str(e)}")
+
+    return {
+        "ok": True,
+        "deleted_count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "file_deleted_count": file_deleted_count,
+    }

@@ -33,7 +33,6 @@ _RE_MD_SECTION = re.compile(
 )
 
 
-
 def _normalize_ar(text: str) -> str:
     t = (text or "").strip()
     if not t:
@@ -198,14 +197,13 @@ class RAGSystem:
         self.api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
         self.vector_store_path = os.getenv("VECTOR_STORE_PATH", "./vector_store")
 
-        # ✅ مهم: لا تستخدم نفس collection القديمة مع موديل جديد
+        # مهم: لا تستخدم نفس collection القديمة مع موديل جديد
         self.collection_name = os.getenv("CHROMA_COLLECTION", "university_docs_e5_v1")
 
         self.embedding_mode = (os.getenv("EMBEDDING_MODE", "local") or "local").strip().lower()
         if self.embedding_mode not in ("local", "openai"):
             self.embedding_mode = "local"
 
-        # ✅ اختياري: يجبرك على موديل E5 حتى لو ENV قديم
         self.force_e5 = (os.getenv("FORCE_E5", "0").strip() == "1")
 
         self.embed_mode: Optional[str] = None
@@ -274,7 +272,7 @@ class RAGSystem:
             print(f"❌ Local embeddings failed: {e}")
 
     # -----------------------------
-    # ✅ E5 prefix helpers
+    # E5 prefix helpers
     # -----------------------------
     def _is_e5(self) -> bool:
         name = (self.local_model_name or "").lower()
@@ -309,7 +307,7 @@ class RAGSystem:
         return None
 
     # -----------------------------
-    # ✅ delete helper (used by DocumentProcessor)
+    # delete helper (used by DocumentProcessor)
     # -----------------------------
     def delete_doc_key(self, doc_key: str) -> None:
         dk = (doc_key or "").strip()
@@ -401,14 +399,14 @@ class RAGSystem:
                 if is_table and table_key:
                     md["table_key"] = table_key
 
-                # ✅ normalize article_no + article_no_norm (Metadata فقط - ما له علاقة بالبحث)
+                # normalize article_no + article_no_norm
                 article_no = str(md.get("article_no") or "").strip()
                 if article_no:
                     article_no = _normalize_digits(article_no)
                     md["article_no"] = article_no
                     md["article_no_norm"] = _normalize_ar(article_no)
 
-                # ✅ استخراج article_no تلقائياً من نص الـ chunk إذا مو موجود في metadata
+                # استخراج article_no تلقائياً من النص إذا غير موجود
                 if not md.get("article_no"):
                     auto_article = _extract_article_no_from_chunk(chunk_text)
                     if auto_article:
@@ -441,7 +439,7 @@ class RAGSystem:
             print(f"✅ Indexed/Upserted {len(docs)} chunks for doc_key={doc_key} (mode={self.embed_mode})")
 
     # =========================================================
-    # ✅ Neighbor helpers (اختياري)
+    # Neighbor helpers
     # =========================================================
     def _chroma_get_by_doc_and_chunk(self, doc_key: str, chunk_index: int) -> Optional[Dict[str, Any]]:
         try:
@@ -452,7 +450,19 @@ class RAGSystem:
             docs = res.get("documents") or []
             metas = res.get("metadatas") or []
             if docs and metas:
-                return {"content": (docs[0] or "").strip(), "metadata": metas[0] or {}, "score": None}
+                meta0 = metas[0] or {}
+                page_number = meta0.get("page_number")
+                try:
+                    page_number = int(page_number) if page_number is not None else None
+                except Exception:
+                    page_number = None
+
+                return {
+                    "content": (docs[0] or "").strip(),
+                    "metadata": meta0,
+                    "score": None,
+                    "page_number": page_number,
+                }
         except Exception:
             pass
 
@@ -465,7 +475,19 @@ class RAGSystem:
             metas = res.get("metadatas") or []
             for d, m in zip(docs, metas):
                 if (m or {}).get("chunk_index") == int(chunk_index):
-                    return {"content": (d or "").strip(), "metadata": m or {}, "score": None}
+                    meta0 = m or {}
+                    page_number = meta0.get("page_number")
+                    try:
+                        page_number = int(page_number) if page_number is not None else None
+                    except Exception:
+                        page_number = None
+
+                    return {
+                        "content": (d or "").strip(),
+                        "metadata": meta0,
+                        "score": None,
+                        "page_number": page_number,
+                    }
         except Exception:
             pass
 
@@ -512,7 +534,7 @@ class RAGSystem:
         return out
 
     # =========================================================
-    # ✅ Semantic search ONLY
+    # Semantic search ONLY
     # =========================================================
     def search(
         self,
@@ -533,7 +555,6 @@ class RAGSystem:
         if not variants:
             return []
 
-        # ✅ semantic only: لا smart_where ولا fallback where=None
         where_candidates: List[Optional[Dict[str, Any]]] = [where]
 
         collected: List[Dict[str, Any]] = []
@@ -559,12 +580,21 @@ class RAGSystem:
                 txt = (doc or "").strip()
                 if not txt:
                     continue
+
+                meta = meta or {}
+                page_number = meta.get("page_number")
+                try:
+                    page_number = int(page_number) if page_number is not None else None
+                except Exception:
+                    page_number = None
+
                 out_local.append(
                     {
                         "content": txt,
-                        "metadata": meta or {},
+                        "metadata": meta,
                         "score": float(dist) if dist is not None else None,
                         "matched_query": qq,
+                        "page_number": page_number,
                     }
                 )
             return out_local
@@ -637,7 +667,7 @@ class RAGSystem:
 
 
 # =========================================================
-# ✅ استخراج رقم المادة تلقائياً من نص الـ chunk (للـ metadata فقط)
+# استخراج رقم المادة تلقائياً من نص الـ chunk (للـ metadata فقط)
 # =========================================================
 _RE_CHUNK_ARTICLE = re.compile(
     r"<h[234]>\s*(?:لل|ل|بال|وال|فال)?م[اآ]د[هة]\s+([^<\n]{1,60}?)\s*:?\s*</h[234]>"

@@ -20,7 +20,6 @@ from sqlalchemy import or_, text
 from admin_api import router as admin_router
 from database import init_db, get_db, AdminUser, Document
 
-# ✅ فقط RAGSystem (بدون search_smart / search_article_exact / _get_article_variants)
 from rag_system import RAGSystem
 from llm_service import LLMService
 from document_processor import DocumentProcessor
@@ -34,8 +33,9 @@ app = FastAPI(title="PSU Chatbot Backend API", version="1.5.0")
 # =========================================================
 LAST_TOPIC = ""
 
-# ✅ تخزين خيارات الملفات المؤقتة لما نسأل المستخدم "أي ملف تقصد؟"
-# ✅ أضفنا pending_user_text عشان لما يختار ملف (زر) نرجع للسؤال الأصلي ونجيب الجواب فوراً
+# =========================================================
+# Pending choices for file disambiguation
+# =========================================================
 PENDING_CHOICES: Dict[str, Any] = {
     "article_phrase": "",
     "candidates": [],
@@ -97,7 +97,6 @@ create_default_admin()
 # =========================================================
 class MessageCreate(BaseModel):
     content: str
-    # ✅ من الفرونت وقت ضغط زر اختيار الملف
     choice_doc_key: Optional[str] = None
 
 
@@ -112,15 +111,20 @@ class ChoiceOut(BaseModel):
     doc_key: str
 
 
+class SourceOut(BaseModel):
+    name: str
+    page: Optional[int] = None
+
+
 class MessageResponse(BaseModel):
     id: int
     content: str
     sender: str
     timestamp: datetime
-    sources: List[str] = []
+    sources: List[SourceOut] = []
     attachments: List[AttachmentOut] = []
-    # ✅ خيارات تظهر كأزرار في الواجهة
     choices: List[ChoiceOut] = []
+    debug: Optional[str] = None
 
 
 # =========================================================
@@ -192,7 +196,7 @@ def _normalize_ar(s: str) -> str:
 
 
 # =========================================================
-# ✅ Arabic text helpers
+# Arabic text helpers
 # =========================================================
 _RE_ARTICLE_PHRASE = re.compile(
     r"(?:لل|ل|بال|وال|فال)?م[اآ]د[هة]\s+([^\n\.<،,:؛!\?؟]{1,60})",
@@ -270,7 +274,7 @@ def _find_best_document(db: Session, query: str) -> Optional[Document]:
 
 
 # =========================================================
-# ✅ Auto-select best doc_key from hits
+# Auto-select best doc_key from hits
 # =========================================================
 def _pick_best_doc_key_from_hits(hits: List[Dict[str, Any]]) -> str:
     if not hits:
@@ -310,7 +314,7 @@ def _pick_best_doc_key_from_hits(hits: List[Dict[str, Any]]) -> str:
 
 
 # =========================================================
-# ✅ Article token helpers (semantic-only filtering)
+# Article token helpers (semantic-only filtering)
 # =========================================================
 def _article_tokens(article_phrase: str) -> List[str]:
     ap = _fix_ar_spacing(article_phrase)
@@ -401,6 +405,71 @@ def _pick_candidate_by_name(
     return best
 
 
+def _extract_sources_with_pages(
+    hits: List[Dict[str, Any]],
+    max_sources: int = 6,
+    max_pages_per_file: int = 2,
+) -> List[SourceOut]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+
+    for h in hits or []:
+        meta = h.get("metadata") or {}
+        name = str(
+            meta.get("original_name")
+            or meta.get("filename")
+            or meta.get("doc_key")
+            or ""
+        ).strip()
+        if not name:
+            continue
+
+        page_number = h.get("page_number")
+        if page_number is None:
+            page_number = meta.get("page_number")
+
+        try:
+            page_number = int(page_number) if page_number is not None else None
+        except Exception:
+            page_number = None
+
+        score = h.get("score")
+        try:
+            score = float(score) if score is not None else 1e9
+        except Exception:
+            score = 1e9
+
+        grouped.setdefault(name, []).append(
+            {
+                "name": name,
+                "page": page_number,
+                "score": score,
+            }
+        )
+
+    out: List[SourceOut] = []
+
+    for name, items in grouped.items():
+        items.sort(key=lambda x: x["score"])
+
+        seen_pages = set()
+        picked = 0
+
+        for item in items:
+            page = item["page"]
+            if page in seen_pages:
+                continue
+            seen_pages.add(page)
+
+            out.append(SourceOut(name=name, page=page))
+            picked += 1
+
+            if picked >= max_pages_per_file:
+                break
+
+    out = out[:max_sources]
+    return out
+
+
 # =========================================================
 # Download endpoint
 # =========================================================
@@ -418,7 +487,7 @@ def download_file(public_id: str, db: Session = Depends(get_db)):
 
 
 # =========================================================
-# Upload docs + RAG processing  ✅ MULTI FILES
+# Upload docs + RAG processing  MULTI FILES
 # =========================================================
 @app.post("/api/admin/documents/upload")
 async def upload_documents(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
@@ -550,19 +619,16 @@ async def upload_documents(files: List[UploadFile] = File(...), db: Session = De
 async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     global LAST_TOPIC, PENDING_CHOICES
 
-    # ✅ إذا جاي اختيار زر (doc_key) نخزنّه ونرجع للسؤال الأصلي
     choice_doc_key = (message.choice_doc_key or "").strip()
     forced_doc_key = ""
 
     if choice_doc_key:
         forced_doc_key = choice_doc_key
-        # لو عندنا سؤال أصلي محفوظ، نرجع له عشان نعطي الجواب مباشرة
         pending_q = (PENDING_CHOICES.get("pending_user_text") or "").strip()
         if pending_q:
             user_text = pending_q
         else:
-            user_text = (message.content or "").strip()  # fallback
-        # نظف حالة الاختيار (بنخلي forced_doc_key يمر لاحقاً)
+            user_text = (message.content or "").strip()
         LAST_TOPIC = ""
         PENDING_CHOICES["forced_doc_key"] = forced_doc_key
         PENDING_CHOICES["candidates"] = []
@@ -590,6 +656,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
             sources=[],
             attachments=[],
             choices=[],
+            debug=None,
         )
 
     request_type = (refined.get("request_type") or "answer").strip().lower()
@@ -597,7 +664,6 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
 
     # =========================
     # FILE REQUEST
-    # (مهم) إذا عندنا اختيار doc_key من الزر → لا تعاملها كطلب ملف حتى لو المستخدم ضغط اسم ملف
     # =========================
     if request_type == "file" and not forced_doc_key:
         q = file_query.strip() if file_query and len(file_query.strip()) >= 3 else user_text
@@ -611,6 +677,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
                 sources=[],
                 attachments=[],
                 choices=[],
+                debug=None,
             )
         if not getattr(doc, "public_id", None):
             pid = uuid.uuid4().hex
@@ -633,6 +700,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
             sources=[],
             attachments=[attachment],
             choices=[],
+            debug=None,
         )
 
     # =========================
@@ -667,7 +735,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         print("🧠 LAST_TOPIC updated:", LAST_TOPIC)
 
     # -------------------------------------------------
-    # ✅ Search config (semantic only)
+    # Search config (semantic only)
     # -------------------------------------------------
     BROAD_TOP_K = int(os.getenv("RAG_BROAD_TOP_K", "40"))
     FOCUSED_TOP_K = int(os.getenv("RAG_FOCUSED_TOP_K", "10"))
@@ -675,6 +743,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     DIST_THRESHOLD = float(os.getenv("RAG_DISTANCE_THRESHOLD", "0.95"))
 
     context_docs: List[Dict[str, Any]] = []
+    source_hits: List[Dict[str, Any]] = []
     broad_hits: List[Dict[str, Any]] = []
     best_doc_key = ""
 
@@ -684,10 +753,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     )
 
     # =========================================================
-    # ✅ SEMANTIC ONLY FLOW
-    # - broad semantic to guess doc_key
-    # - focused semantic with doc_key filter
-    # - optional article filtering
+    # SEMANTIC ONLY FLOW
     # =========================================================
     try:
         broad_hits = rag_system.search(
@@ -700,7 +766,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         print("RAG broad search error:", e)
         broad_hits = []
 
-    # إذا سؤال مادة: فلترة broad hits بالمادة ثم قرر doc_key
+    # إذا سؤال مادة
     if article_phrase:
         filtered_article_hits = _filter_hits_for_article(broad_hits, article_phrase)
         candidates = _rank_doc_candidates_from_hits(filtered_article_hits, top_n=6)
@@ -708,14 +774,13 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         if forced_doc_key2:
             best_doc_key = forced_doc_key2
         else:
-            # ✅ إذا أكثر من ملف → رجّع choices أزرار
             if len(candidates) >= 2:
                 LAST_TOPIC = f"{article_phrase}::choose_doc"
                 PENDING_CHOICES = {
                     "article_phrase": article_phrase,
                     "candidates": candidates,
                     "forced_doc_key": "",
-                    "pending_user_text": user_text,  # ✅ نحفظ السؤال الأصلي
+                    "pending_user_text": user_text,
                     "ts": datetime.utcnow(),
                 }
                 choices = [
@@ -733,6 +798,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
                     sources=[],
                     attachments=[],
                     choices=choices,
+                    debug=None,
                 )
 
             best_doc_key = _pick_best_doc_key_from_hits(filtered_article_hits) or _pick_best_doc_key_from_hits(broad_hits)
@@ -743,7 +809,24 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     if best_doc_key:
         print("🎯 Auto-selected doc_key:", best_doc_key)
 
-    # Focused semantic search
+    # -------------------------------------------------
+    # مصدر العرض: بدون neighbors
+    # -------------------------------------------------
+    try:
+        source_hits = rag_system.search(
+            retrieval_query,
+            top_k=FOCUSED_TOP_K,
+            include_neighbors=False,
+            neighbor_window=0,
+            where={"doc_key": best_doc_key} if best_doc_key else None,
+        ) or []
+    except Exception as e:
+        print("RAG source search error:", e)
+        source_hits = []
+
+    # -------------------------------------------------
+    # سياق الجواب: مع neighbors
+    # -------------------------------------------------
     try:
         context_docs = rag_system.search(
             retrieval_query,
@@ -756,14 +839,31 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         print("RAG focused search error:", e)
         context_docs = []
 
-    # Article filter on focused results (semantic-only reinforcement)
+    # Article filter on source hits
+    if article_phrase and source_hits:
+        filtered_sources = _filter_hits_for_article(source_hits, article_phrase)
+        if filtered_sources:
+            source_hits = filtered_sources
+
+    # Article filter on focused results
     if article_phrase and context_docs:
         filtered2 = _filter_hits_for_article(context_docs, article_phrase)
         if filtered2:
             context_docs = filtered2
 
-    # Fallback: focused without doc_key
+    # Fallback
     if not context_docs and broad_hits:
+        try:
+            source_hits = rag_system.search(
+                retrieval_query,
+                top_k=FOCUSED_TOP_K,
+                include_neighbors=False,
+                neighbor_window=0,
+            ) or []
+        except Exception as e:
+            print("RAG fallback source search error:", e)
+            source_hits = []
+
         try:
             context_docs = rag_system.search(
                 retrieval_query,
@@ -775,12 +875,17 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
             print("RAG fallback search error:", e)
             context_docs = []
 
+        if article_phrase and source_hits:
+            filtered_sources2 = _filter_hits_for_article(source_hits, article_phrase)
+            if filtered_sources2:
+                source_hits = filtered_sources2
+
         if article_phrase and context_docs:
             filtered3 = _filter_hits_for_article(context_docs, article_phrase)
             if filtered3:
                 context_docs = filtered3
 
-    # Threshold gate (لا نطبقه على أسئلة المواد)
+    # Threshold gate
     best_score = None
     for d in context_docs:
         sc = d.get("score")
@@ -790,36 +895,44 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
     if (not article_phrase) and (best_score is not None) and (best_score > DIST_THRESHOLD):
         print(f"🚫 Best distance {best_score:.4f} > threshold {DIST_THRESHOLD:.4f} → empty context")
         context_docs = []
+        source_hits = []
 
-    # ✅ DEBUG
-    print("\n================ RAG DEBUG ================")
-    print("user_text:", user_text)
-    print("refined_question:", refined_question)
-    print("intent:", intent)
-    print("retrieval_query:", retrieval_query)
-    print("article_phrase:", article_phrase)
-    print("wants_exec_rules:", wants_exec_rules)
-    print("broad_hits:", len(broad_hits))
-    print("best_doc_key:", best_doc_key)
-    print("hits:", len(context_docs))
-    print("best_score:", best_score)
+    # DEBUG
+    debug_lines = []
+    debug_lines.append("===== RAG DEBUG =====")
+    debug_lines.append(f"user_text: {user_text}")
+    debug_lines.append(f"refined_question: {refined_question}")
+    debug_lines.append(f"intent: {intent}")
+    debug_lines.append(f"retrieval_query: {retrieval_query}")
+    debug_lines.append(f"article_phrase: {article_phrase}")
+    debug_lines.append(f"wants_exec_rules: {wants_exec_rules}")
+    debug_lines.append(f"broad_hits: {len(broad_hits)}")
+    debug_lines.append(f"best_doc_key: {best_doc_key}")
+    debug_lines.append(f"source_hits: {len(source_hits)}")
+    debug_lines.append(f"hits: {len(context_docs)}")
+    debug_lines.append(f"best_score: {best_score}")
+
     for i, d in enumerate(context_docs[:5], 1):
         meta = d.get("metadata") or {}
         content = (d.get("content") or "").strip()
-        print(f"\n--- HIT {i} ---")
-        print("score:", d.get("score"))
-        print("doc_key:", meta.get("doc_key"))
-        print("original_name:", meta.get("original_name") or meta.get("filename"))
-        print("chunk_index:", meta.get("chunk_index"))
-        print("chunk_type:", meta.get("chunk_type"))
-        print("section_type:", meta.get("section_type"))
-        print("article_no:", meta.get("article_no"))
-        print("h2:", meta.get("h2"))
-        print("h3:", meta.get("h3"))
-        print("is_table:", meta.get("is_table"))
-        print("content_len:", len(content))
-        print("content_preview:", content[:300].replace("\n", " "))
-    print("===========================================\n")
+        debug_lines.append(f"\n--- HIT {i} ---")
+        debug_lines.append(f"score: {d.get('score')}")
+        debug_lines.append(f"doc_key: {meta.get('doc_key')}")
+        debug_lines.append(f"original_name: {meta.get('original_name') or meta.get('filename')}")
+        debug_lines.append(f"chunk_index: {meta.get('chunk_index')}")
+        debug_lines.append(f"page_number: {d.get('page_number') or meta.get('page_number')}")
+        debug_lines.append(f"chunk_type: {meta.get('chunk_type')}")
+        debug_lines.append(f"section_type: {meta.get('section_type')}")
+        debug_lines.append(f"article_no: {meta.get('article_no')}")
+        debug_lines.append(f"h2: {meta.get('h2')}")
+        debug_lines.append(f"h3: {meta.get('h3')}")
+        debug_lines.append(f"is_table: {meta.get('is_table')}")
+        debug_lines.append(f"content_len: {len(content)}")
+        debug_lines.append(f"content_preview: {content}")
+
+    debug_text = "\n".join(debug_lines)
+
+    print("\n" + debug_text + "\n")
 
     ai_text = llm_service.generate_response(
         user_query=user_text,
@@ -830,16 +943,15 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         system_message=None,
     )
 
-    sources = llm_service.extract_sources(
-        context_docs or [],
-        max_sources=int(os.getenv("MAX_SOURCES", "4")),
+    sources = _extract_sources_with_pages(
+        source_hits or context_docs or [],
+        max_sources=int(os.getenv("MAX_SOURCES", "6")),
+        max_pages_per_file=int(os.getenv("MAX_PAGES_PER_FILE", "2")),
     )
 
-    # نظّف forced_doc_key بعد ما نستخدمه
     if PENDING_CHOICES.get("forced_doc_key"):
         PENDING_CHOICES["forced_doc_key"] = ""
     if PENDING_CHOICES.get("pending_user_text"):
-        # نخليه فاضي عشان ما يأثر على أسئلة جديدة
         PENDING_CHOICES["pending_user_text"] = ""
 
     return MessageResponse(
@@ -850,6 +962,7 @@ async def send_message(message: MessageCreate, db: Session = Depends(get_db)):
         sources=sources,
         attachments=[],
         choices=[],
+        debug=debug_text,
     )
 
 

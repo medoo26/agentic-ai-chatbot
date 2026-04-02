@@ -109,20 +109,15 @@ class DocumentProcessor:
         if not h:
             return ""
 
-        # remove doctype
         h = re.sub(r"(?is)<!doctype[^>]*>", "", h).strip()
-        # remove <html ...> and </html>
         h = re.sub(r"(?is)<html\b[^>]*>", "", h).strip()
         h = re.sub(r"(?is)</html\s*>", "", h).strip()
-        # remove <head ...>...</head>
         h = re.sub(r"(?is)<head\b[^>]*>.*?</head\s*>", "", h).strip()
 
-        # if <body> exists -> take inside
         m = re.search(r"(?is)<body\b[^>]*>(.*?)</body\s*>", h)
         if m:
             return (m.group(1) or "").strip()
 
-        # else remove body tags if present but broken
         h = re.sub(r"(?is)<body\b[^>]*>", "", h).strip()
         h = re.sub(r"(?is)</body\s*>", "", h).strip()
         return h.strip()
@@ -159,8 +154,6 @@ class DocumentProcessor:
 
     # =========================================================
     # ✅ Split BODY by H1/H2/H3 only
-    # - This keeps H4 (القواعد التنفيذية) inside the same مادة chunk
-    # - Does NOT edit HTML. Just splits for indexing.
     # =========================================================
     def _split_html_by_h123(self, html_doc: str) -> List[str]:
         html_doc = (html_doc or "").strip()
@@ -171,14 +164,11 @@ class DocumentProcessor:
         if not body:
             return []
 
-        # Split markers: ONLY h1/h2/h3
         split_pat = re.compile(r"(?is)(<h[1-3]\b[^>]*>.*?</h[1-3]\s*>)")
         parts = split_pat.split(body)
 
-        # parts: [before, h, after, h, after ...]
         blocks: List[str] = []
         if len(parts) == 1:
-            # no h1/h2/h3 at all -> return as one
             return [body.strip()] if body.strip() else []
 
         before = (parts[0] or "").strip()
@@ -216,7 +206,7 @@ class DocumentProcessor:
         return [m for m in merged if (m or "").strip()]
 
     # =========================================================
-    # Delete old indexed chunks for the same doc_key (important!)
+    # Delete old indexed chunks for the same doc_key
     # =========================================================
     def _delete_existing_index(self, doc_key: str) -> None:
         dk = (doc_key or "").strip()
@@ -253,11 +243,15 @@ class DocumentProcessor:
         try:
             content = ""
             tables_md: List[str] = []
+            pdf_pages: List[Dict[str, Any]] = []
 
             if file_ext in [".png", ".jpg", ".jpeg"]:
                 content = self._process_image(file_path)
             elif file_ext == ".pdf":
-                content = self._process_pdf(file_path)
+                pdf_pages = self._process_pdf_pages(file_path)
+                content = "\n\n".join(
+                    p["text"] for p in pdf_pages if (p.get("text") or "").strip()
+                ).strip()
             elif file_ext in [".docx", ".doc"]:
                 content, tables_md = self._process_docx_with_tables(file_path)
             elif file_ext == ".txt":
@@ -276,7 +270,7 @@ class DocumentProcessor:
             original_name = self._clean_original_name(stored_filename)
 
             doc_key = (original_name or stored_filename).strip()
-            document_id = doc_key  # stable for chunk ids
+            document_id = doc_key
 
             metadata: Dict[str, Any] = {
                 "original_name": original_name,
@@ -306,64 +300,132 @@ class DocumentProcessor:
                     "تأكد من تعديل llm_service.py وتمريره هنا."
                 )
 
-            # hard cap
-            if len(raw_text_for_llm) > self.html_hard_max_chars:
-                raw_text_for_llm = raw_text_for_llm[: self.html_hard_max_chars]
-                print(f"✂️ Truncated raw text to {len(raw_text_for_llm)} chars (HTML_HARD_MAX_CHARS)")
-
-            segments = self._split_text_segments(raw_text_for_llm)
-            print(
-                f"🧩 HTML convert segments={len(segments)} total_chars={len(raw_text_for_llm)} timeout={self.html_llm_timeout}s"
-            )
-
-            # collect BODY only from each segment
-            body_parts: List[str] = []
             save_name = original_name or stored_filename
 
-            for si, seg in enumerate(segments, start=1):
-                seg = (seg or "").strip()
-                if not seg:
-                    continue
+            # =========================================================
+            # Build html units
+            # For PDF: one unit per page with page_number
+            # For others: old segmented behavior with page_number=None
+            # =========================================================
+            html_units: List[Dict[str, Any]] = []
 
-                print(f"🚀 Segment {si}/{len(segments)} chars={len(seg)}")
+            if file_ext == ".pdf" and pdf_pages:
+                print(
+                    f"🧩 HTML convert pdf pages={len(pdf_pages)} timeout={self.html_llm_timeout}s"
+                )
 
-                try:
-                    out = await asyncio.wait_for(
-                        self._maybe_await(self.llm_service.to_structured_html(seg)),
-                        timeout=self.html_llm_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    print(f"⏱️ Segment {si} timed out")
-                    continue
+                for page_item in pdf_pages:
+                    page_text = (page_item.get("text") or "").strip()
+                    page_number = page_item.get("page_number")
 
-                inner = self._strip_outer_html(out or "")
-                if inner:
-                    body_parts.append(inner)
+                    if not page_text:
+                        continue
 
-            body_inner_all = "\n\n".join(body_parts).strip()
+                    if len(page_text) > self.html_hard_max_chars:
+                        page_text = page_text[: self.html_hard_max_chars]
+
+                    print(f"🚀 PDF page {page_number}/{len(pdf_pages)} chars={len(page_text)}")
+
+                    try:
+                        out = await asyncio.wait_for(
+                            self._maybe_await(self.llm_service.to_structured_html(page_text)),
+                            timeout=self.html_llm_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"⏱️ PDF page {page_number} timed out")
+                        continue
+
+                    inner = self._strip_outer_html(out or "")
+                    if inner:
+                        html_units.append({
+                            "page_number": page_number,
+                            "html": inner,
+                        })
+
+            else:
+                if len(raw_text_for_llm) > self.html_hard_max_chars:
+                    raw_text_for_llm = raw_text_for_llm[: self.html_hard_max_chars]
+                    print(f"✂️ Truncated raw text to {len(raw_text_for_llm)} chars (HTML_HARD_MAX_CHARS)")
+
+                segments = self._split_text_segments(raw_text_for_llm)
+                print(
+                    f"🧩 HTML convert segments={len(segments)} total_chars={len(raw_text_for_llm)} timeout={self.html_llm_timeout}s"
+                )
+
+                for si, seg in enumerate(segments, start=1):
+                    seg = (seg or "").strip()
+                    if not seg:
+                        continue
+
+                    print(f"🚀 Segment {si}/{len(segments)} chars={len(seg)}")
+
+                    try:
+                        out = await asyncio.wait_for(
+                            self._maybe_await(self.llm_service.to_structured_html(seg)),
+                            timeout=self.html_llm_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"⏱️ Segment {si} timed out")
+                        continue
+
+                    inner = self._strip_outer_html(out or "")
+                    if inner:
+                        html_units.append({
+                            "page_number": None,
+                            "html": inner,
+                        })
+
+            body_inner_all = "\n\n".join(
+                (u.get("html") or "").strip()
+                for u in html_units
+                if (u.get("html") or "").strip()
+            ).strip()
+
             if not body_inner_all:
                 print("⚠️ LLM رجّع HTML فارغ")
                 return {"html": "", "converted_txt_path": "", "converted_name": ""}
 
-            # single HTML doc
             html = self._wrap_html_document(body_inner_all, title=save_name)
-
             converted_txt_path, converted_name = self._save_converted_html_as_txt(save_name, html)
 
-            # ✅ split for indexing by H1/H2/H3 only (keeps H4 inside)
-            chunks_html = self._split_html_by_h123(html)
-            print(f"🧩 HTML chunks produced: {len(chunks_html)}")
+            # =========================================================
+            # Prepare chunks for indexing
+            # PDF: each page html = chunk with page_number
+            # Others: split by H1/H2/H3, no page number
+            # =========================================================
+            chunks_to_index: List[Dict[str, Any]] = []
 
-            if not chunks_html:
+            if file_ext == ".pdf" and html_units:
+                for unit in html_units:
+                    chunk_html = (unit.get("html") or "").strip()
+                    if not chunk_html:
+                        continue
+                    chunks_to_index.append({
+                        "html": chunk_html,
+                        "page_number": unit.get("page_number"),
+                    })
+                print(f"🧩 PDF chunks produced: {len(chunks_to_index)}")
+            else:
+                chunks_html = self._split_html_by_h123(html)
+                print(f"🧩 HTML chunks produced: {len(chunks_html)}")
+
+                for chunk_html in chunks_html:
+                    chunk_html = (chunk_html or "").strip()
+                    if not chunk_html:
+                        continue
+                    chunks_to_index.append({
+                        "html": chunk_html,
+                        "page_number": None,
+                    })
+
+            if not chunks_to_index:
                 return {"html": html, "converted_txt_path": converted_txt_path, "converted_name": converted_name}
 
-            # delete old chunks
             self._delete_existing_index(doc_key)
 
-            # index plain text + keep chunk html in metadata for UI preview
             if self.rag_system:
-                for idx, chunk_html in enumerate(chunks_html, start=0):
-                    chunk_html = (chunk_html or "").strip()
+                for idx, item in enumerate(chunks_to_index, start=0):
+                    chunk_html = (item.get("html") or "").strip()
                     if not chunk_html:
                         continue
 
@@ -377,7 +439,11 @@ class DocumentProcessor:
                     chunk_meta["converted_file"] = converted_txt_path
                     chunk_meta["skip_chunking"] = True
                     chunk_meta["chunk_index"] = int(idx)
-                    chunk_meta["html"] = chunk_html  # optional: show exact HTML chunk
+                    chunk_meta["html"] = chunk_html
+
+                    page_number = item.get("page_number")
+                    if page_number is not None:
+                        chunk_meta["page_number"] = int(page_number)
 
                     self.rag_system.add_document(
                         content=chunk_plain,
@@ -425,6 +491,40 @@ class DocumentProcessor:
         pytesseract, Image, _convert_from_path = ocr
         text = pytesseract.image_to_string(Image.open(file_path), lang="ara+eng")
         return self._clean_text_keep_tables(text)
+
+    def _process_pdf_pages(self, file_path: str) -> List[Dict[str, Any]]:
+        reader = PdfReader(file_path)
+        pages: List[Dict[str, Any]] = []
+
+        for i, page in enumerate(reader.pages, start=1):
+            extracted = page.extract_text() or ""
+            cleaned = self._clean_text_keep_tables(extracted)
+
+            if cleaned.strip():
+                pages.append({
+                    "page_number": i,
+                    "text": cleaned,
+                })
+
+        # OCR fallback only if no extracted pages found
+        if self.enable_ocr and not pages:
+            ocr = self._try_import_ocr()
+            if ocr:
+                pytesseract, _Image, convert_from_path = ocr
+                try:
+                    images = convert_from_path(file_path)
+                    for i, img in enumerate(images, start=1):
+                        ocr_text = pytesseract.image_to_string(img, lang="ara+eng")
+                        cleaned = self._clean_text_keep_tables(ocr_text)
+                        if cleaned.strip():
+                            pages.append({
+                                "page_number": i,
+                                "text": cleaned,
+                            })
+                except Exception as e:
+                    print("⚠️ PDF OCR failed:", e)
+
+        return pages
 
     def _process_pdf(self, file_path: str) -> str:
         reader = PdfReader(file_path)

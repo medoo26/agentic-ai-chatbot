@@ -11,7 +11,7 @@ import {
   TableHeader,
   TableRow,
 } from "../../components/ui/table";
-import { apiDelete, apiGet } from "../../../api";
+import { apiGet, apiPost } from "../../../api";
 import {
   Upload,
   Trash2,
@@ -62,27 +62,29 @@ export default function DocumentsPage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
-  // ✅ multiple
   const [files, setFiles] = useState<File[]>([]);
-
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
 
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // ✅ Summary
   const totalFiles = docs.length;
   const totalSizeMb = docs.reduce((sum, d) => {
     const v = typeof d.size_mb === "number" ? d.size_mb : 0;
     return sum + v;
   }, 0);
 
+  const selectedCount = selectedIds.length;
+  const allSelected = docs.length > 0 && selectedIds.length === docs.length;
+
   const handleLogout = () => {
     sessionStorage.removeItem("adminAuth");
     navigate("/admin/login");
   };
 
-  // Toast auto hide
   useEffect(() => {
     if (!err && !msg) return;
     const t = setTimeout(() => {
@@ -97,7 +99,9 @@ export default function DocumentsPage() {
     setErr("");
     try {
       const data = await apiGet("/api/admin/documents");
-      setDocs(Array.isArray(data) ? data : []);
+      const arr = Array.isArray(data) ? data : [];
+      setDocs(arr);
+      setSelectedIds((prev) => prev.filter((id) => arr.some((d: DocumentOut) => d.id === id)));
     } catch (e: any) {
       setErr(e?.message || "تعذر تحميل الملفات");
     } finally {
@@ -109,7 +113,7 @@ export default function DocumentsPage() {
     loadDocs();
   }, []);
 
-  const clearSelected = () => {
+  const clearSelectedFiles = () => {
     setFiles([]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
@@ -156,7 +160,6 @@ export default function DocumentsPage() {
       const token = sessionStorage.getItem("adminAuth") || "";
 
       const fd = new FormData();
-      // ✅ IMPORTANT: اسم الحقل لازم يكون "files"
       files.forEach((f) => fd.append("files", f));
 
       const res = await fetch(`${API_BASE}/api/admin/documents/upload`, {
@@ -186,7 +189,7 @@ export default function DocumentsPage() {
         setMsg("تم رفع الملفات ✅");
       }
 
-      clearSelected();
+      clearSelectedFiles();
       await loadDocs();
     } catch (e: any) {
       setErr(e?.message || "فشل رفع الملفات");
@@ -195,19 +198,61 @@ export default function DocumentsPage() {
     }
   };
 
-  const deleteDoc = async (id: number) => {
-    if (!confirm("حذف الملف؟")) return;
+  const startSelectionMode = () => {
+    setSelectionMode(true);
+    setSelectedIds([]);
+    setErr("");
+    setMsg("");
+  };
+
+  const cancelSelectionMode = () => {
+    setSelectionMode(false);
+    setSelectedIds([]);
+  };
+
+  const toggleOne = (id: number) => {
+    if (!selectionMode) return;
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  const toggleAll = () => {
+    if (!selectionMode) return;
+
+    if (allSelected) {
+      setSelectedIds([]);
+      return;
+    }
+    setSelectedIds(docs.map((d) => d.id));
+  };
+
+  const deleteSelectedDocs = async () => {
+    if (selectedIds.length === 0) {
+      setErr("حدد ملفًا واحدًا على الأقل");
+      return;
+    }
+
+    const ok = confirm(
+      `هل أنت متأكد أنك تريد حذف ${selectedIds.length} ملف/ملفات؟`
+    );
+    if (!ok) return;
 
     setBusy(true);
     setErr("");
     setMsg("");
 
     try {
-      await apiDelete(`/api/admin/documents/${id}`);
-      setMsg("تم حذف الملف ✅");
+      await apiPost("/api/admin/documents/bulk-delete", {
+        ids: selectedIds,
+      });
+
+      setMsg(`تم حذف ${selectedIds.length} ملف/ملفات ✅`);
+      setSelectedIds([]);
+      setSelectionMode(false);
       await loadDocs();
     } catch (e: any) {
-      setErr(e?.message || "فشل حذف الملف");
+      setErr(e?.message || "فشل حذف الملفات المحددة");
     } finally {
       setBusy(false);
     }
@@ -222,7 +267,6 @@ export default function DocumentsPage() {
 
   return (
     <div className="min-h-screen bg-gray-50" dir="rtl">
-      {/* ✅ Top Bar */}
       <div className="sticky top-0 z-40 bg-white border-b border-gray-200">
         <div className="h-14 px-4 flex items-center justify-between">
           <div className="font-bold text-gray-800">إدارة الملفات</div>
@@ -241,7 +285,6 @@ export default function DocumentsPage() {
 
       <main className="p-6">
         <div className="space-y-6">
-          {/* Toast */}
           {(err || msg) && (
             <div className="fixed top-4 right-4 z-50 whitespace-pre-line">
               <div
@@ -271,7 +314,6 @@ export default function DocumentsPage() {
             </div>
           )}
 
-          {/* Summary */}
           <Card className="p-4 rounded-2xl">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-8">
@@ -288,6 +330,16 @@ export default function DocumentsPage() {
                     {totalSizeMb.toFixed(2)} MB
                   </div>
                 </div>
+
+                {selectionMode && (
+                  <>
+                    <div className="h-10 w-px bg-gray-200 hidden sm:block" />
+                    <div>
+                      <div className="text-sm text-gray-500">المحدد</div>
+                      <div className="text-2xl font-bold">{selectedCount}</div>
+                    </div>
+                  </>
+                )}
               </div>
 
               <div className="w-12 h-12 rounded-2xl bg-green-50 flex items-center justify-center">
@@ -296,13 +348,12 @@ export default function DocumentsPage() {
             </div>
           </Card>
 
-          {/* Upload */}
           <Card className="p-4">
             <div className="flex flex-col md:flex-row gap-3 items-start md:items-center">
               <input
                 ref={fileInputRef}
                 type="file"
-                multiple // ✅
+                multiple
                 accept=".pdf,.doc,.docx,.txt"
                 className="hidden"
                 onChange={(e) => onPickFiles(e.target.files)}
@@ -332,7 +383,10 @@ export default function DocumentsPage() {
                     <div className="font-semibold">الملفات المختارة:</div>
                     <div className="max-h-24 overflow-auto pr-1 space-y-0.5">
                       {files.map((f) => (
-                        <div key={`${f.name}-${f.size}-${f.lastModified}`} className="break-all">
+                        <div
+                          key={`${f.name}-${f.size}-${f.lastModified}`}
+                          className="break-all"
+                        >
                           • {f.name}
                         </div>
                       ))}
@@ -358,7 +412,7 @@ export default function DocumentsPage() {
                 type="button"
                 variant="outline"
                 className="rounded-xl w-full md:w-auto"
-                onClick={clearSelected}
+                onClick={clearSelectedFiles}
                 disabled={files.length === 0 || busy}
               >
                 إلغاء
@@ -366,44 +420,118 @@ export default function DocumentsPage() {
             </div>
           </Card>
 
-          {/* Table */}
           <Card className="p-4">
+            <div className="flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between mb-4">
+              <div className="text-sm font-medium text-gray-700">
+                {selectionMode
+                  ? "حدد الملفات التي تريد حذفها"
+                  : "لحذف أكثر من ملف، اضغط زر الحذف"}
+              </div>
+
+              <div className="flex gap-2 flex-wrap">
+                {!selectionMode ? (
+                  <Button
+                    type="button"
+                    className="rounded-xl bg-red-600 hover:bg-red-700 text-white"
+                    onClick={startSelectionMode}
+                    disabled={loading || busy || docs.length === 0}
+                  >
+                    <Trash2 className="ml-2 h-4 w-4" />
+                    حذف
+                  </Button>
+                ) : (
+                  <>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="rounded-xl"
+                      onClick={toggleAll}
+                      disabled={loading || busy || docs.length === 0}
+                    >
+                      {allSelected ? "إلغاء تحديد الكل" : "تحديد الكل"}
+                    </Button>
+
+                    <Button
+                      type="button"
+                      className="rounded-xl bg-red-600 hover:bg-red-700 text-white"
+                      onClick={deleteSelectedDocs}
+                      disabled={busy || selectedIds.length === 0}
+                    >
+                      <Trash2 className="ml-2 h-4 w-4" />
+                      حذف المحدد
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="rounded-xl"
+                      onClick={cancelSelectionMode}
+                      disabled={busy}
+                    >
+                      إلغاء
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
+
             {loading ? (
               "جاري التحميل..."
             ) : (
               <Table>
                 <TableHeader>
                   <TableRow>
+                    {selectionMode && (
+                      <TableHead className="w-[60px] text-center">
+                        <input
+                          type="checkbox"
+                          checked={allSelected}
+                          onChange={toggleAll}
+                          disabled={docs.length === 0 || busy}
+                          className="w-4 h-4"
+                        />
+                      </TableHead>
+                    )}
                     <TableHead>الاسم</TableHead>
                     <TableHead>الحجم</TableHead>
                     <TableHead>التاريخ</TableHead>
-                    <TableHead>إجراءات</TableHead>
                   </TableRow>
                 </TableHeader>
+
                 <TableBody>
-                  {docs.map((d) => (
-                    <TableRow key={d.id}>
-                      <TableCell className="font-medium">{d.name}</TableCell>
-                      <TableCell>{formatSize(d.size_mb)}</TableCell>
-                      <TableCell>{formatDateAr(d.uploaded_at)}</TableCell>
-                      <TableCell>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="text-red-600 border-red-200 hover:bg-red-50 rounded-xl"
-                          onClick={() => deleteDoc(d.id)}
-                          disabled={busy}
-                        >
-                          <Trash2 className="ml-1 h-4 w-4" />
-                          حذف
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                  {docs.map((d) => {
+                    const checked = selectedIds.includes(d.id);
+
+                    return (
+                      <TableRow
+                        key={d.id}
+                        className={checked ? "bg-red-50/40" : ""}
+                      >
+                        {selectionMode && (
+                          <TableCell className="text-center">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleOne(d.id)}
+                              disabled={busy}
+                              className="w-4 h-4"
+                            />
+                          </TableCell>
+                        )}
+
+                        <TableCell className="font-medium">{d.name}</TableCell>
+                        <TableCell>{formatSize(d.size_mb)}</TableCell>
+                        <TableCell>{formatDateAr(d.uploaded_at)}</TableCell>
+                      </TableRow>
+                    );
+                  })}
 
                   {docs.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={4} className="text-center text-gray-500">
+                      <TableCell
+                        colSpan={selectionMode ? 4 : 3}
+                        className="text-center text-gray-500"
+                      >
                         لا توجد ملفات
                       </TableCell>
                     </TableRow>

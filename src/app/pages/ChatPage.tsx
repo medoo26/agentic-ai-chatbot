@@ -8,19 +8,24 @@ import { Send, LogOut, Plus, Bot, Download, FileText } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-// ✅ API
+// API
 import { apiPost, API_BASE_URL } from "../../api";
 
 type Attachment = {
   name: string;
-  url: string; // غالباً تجي "/api/files/123"
+  url: string;
   mime?: string;
   size_mb?: number;
 };
 
 type ChoiceItem = {
-  label: string;   // اسم الملف الظاهر
-  doc_key: string; // doc_key الحقيقي للفلترة
+  label: string;
+  doc_key: string;
+};
+
+type SourceItem = {
+  name: string;
+  page?: number | null;
 };
 
 type ApiMessage = {
@@ -28,11 +33,10 @@ type ApiMessage = {
   content: string;
   sender: "user" | "assistant";
   timestamp: string;
-  sources?: string[];
+  sources?: SourceItem[];
   attachments?: Attachment[];
-
-  // ✅ NEW: خيارات اختيار المصدر
   choices?: ChoiceItem[];
+  debug?: string;
 };
 
 type UIMessage = {
@@ -40,9 +44,10 @@ type UIMessage = {
   content: string;
   sender: "user" | "assistant";
   timestamp: Date;
-  sources?: string[];
+  sources?: SourceItem[];
   attachments?: Attachment[];
   choices?: ChoiceItem[];
+  debug?: string;
 };
 
 export function ChatPage() {
@@ -51,8 +56,6 @@ export function ChatPage() {
   const [messages, setMessages] = useState<UIMessage[]>([]);
   const [inputMessage, setInputMessage] = useState("");
   const [sending, setSending] = useState(false);
-
-  // ✅ لمنع سبام الضغط على أكثر من خيار بسرعة
   const [choosing, setChoosing] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -72,14 +75,12 @@ export function ChatPage() {
     setInputMessage("");
   };
 
-  // ✅ Helper لبناء رابط كامل للتحميل
   const toAbsoluteUrl = (url: string) => {
     if (!url) return "";
     if (/^https?:\/\//i.test(url)) return url;
     return `${API_BASE_URL}${url.startsWith("/") ? url : `/${url}`}`;
   };
 
-  // ✅ إرسال رسالة عادية
   const sendMessage = async (content: string) => {
     if (!content.trim() || sending || choosing) return;
     setSending(true);
@@ -92,6 +93,7 @@ export function ChatPage() {
       sources: [],
       attachments: [],
       choices: [],
+      debug: "",
     };
 
     setMessages((prev) => [...prev, userMsg]);
@@ -105,9 +107,10 @@ export function ChatPage() {
         content: ai.content,
         sender: ai.sender,
         timestamp: new Date(ai.timestamp),
-        sources: ai.sources || [],
+        sources: Array.isArray(ai.sources) ? ai.sources : [],
         attachments: Array.isArray(ai.attachments) ? ai.attachments : [],
         choices: Array.isArray(ai.choices) ? ai.choices : [],
+        debug: ai.debug || "",
       };
 
       setMessages((prev) => [...prev, aiMsg]);
@@ -120,6 +123,7 @@ export function ChatPage() {
         sources: [],
         attachments: [],
         choices: [],
+        debug: "",
       };
       setMessages((prev) => [...prev, errMsg]);
     } finally {
@@ -127,14 +131,11 @@ export function ChatPage() {
     }
   };
 
-  // ✅ إرسال اختيار مصدر (زر)
-  // الفكرة: نرسل content للعرض + choice_doc_key للباكند
   const sendChoice = async (label: string, doc_key: string) => {
     if (!label || !doc_key || sending || choosing) return;
 
     setChoosing(true);
 
-    // (اختياري) نعرض اختيارك كفقاعة مستخدم صغيرة
     const userMsg: UIMessage = {
       id: `u-choice-${Date.now()}`,
       content: label,
@@ -143,13 +144,14 @@ export function ChatPage() {
       sources: [],
       attachments: [],
       choices: [],
+      debug: "",
     };
     setMessages((prev) => [...prev, userMsg]);
 
     try {
       const ai = await apiPost<ApiMessage>("/api/chat", {
         content: label,
-        choice_doc_key: doc_key, // ✅ مهم
+        choice_doc_key: doc_key,
       });
 
       const aiMsg: UIMessage = {
@@ -157,9 +159,10 @@ export function ChatPage() {
         content: ai.content,
         sender: ai.sender,
         timestamp: new Date(ai.timestamp),
-        sources: ai.sources || [],
+        sources: Array.isArray(ai.sources) ? ai.sources : [],
         attachments: Array.isArray(ai.attachments) ? ai.attachments : [],
         choices: Array.isArray(ai.choices) ? ai.choices : [],
+        debug: ai.debug || "",
       };
 
       setMessages((prev) => [...prev, aiMsg]);
@@ -172,6 +175,7 @@ export function ChatPage() {
         sources: [],
         attachments: [],
         choices: [],
+        debug: "",
       };
       setMessages((prev) => [...prev, errMsg]);
     } finally {
@@ -181,7 +185,6 @@ export function ChatPage() {
 
   return (
     <div className="h-dvh flex flex-col bg-white overflow-hidden" dir="rtl">
-      {/* Header */}
       <div className="bg-white border-b border-gray-200 p-3 lg:p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
@@ -217,7 +220,6 @@ export function ChatPage() {
         </div>
       </div>
 
-      {/* Messages */}
       <ScrollArea className="flex-1 min-h-0 p-4 lg:p-6 bg-white">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full space-y-6">
@@ -241,17 +243,17 @@ export function ChatPage() {
               >
                 <div
                   className={`w-fit max-w-[85%] sm:max-w-[70%] rounded-2xl p-4 break-words whitespace-pre-wrap ${
-                    m.sender === "user"
+                    m.sender === "assistant"
                       ? "bg-[#2E7D32] text-white"
-                      : "bg-gray-100 text-gray-800"
+                      : "bg-gray-100 text-gray-800 border border-gray-200"
                   }`}
                 >
                   {m.sender === "assistant" && (
                     <div className="flex items-center gap-2 mb-2">
-                      <div className="w-6 h-6 bg-[#2E7D32] rounded-full flex items-center justify-center">
+                      <div className="w-6 h-6 bg-white/20 rounded-full flex items-center justify-center">
                         <Bot className="w-4 h-4 text-white" />
                       </div>
-                      <span className="text-xs font-semibold text-[#2E7D32]">
+                      <span className="text-xs font-semibold text-white">
                         المساعد الذكي
                       </span>
                     </div>
@@ -259,13 +261,21 @@ export function ChatPage() {
 
                   {m.sender === "assistant" ? (
                     <div
+                      dir="rtl"
                       className="
-                        text-sm leading-relaxed break-words
+                        text-sm leading-relaxed break-words text-right
+                        [&_*]:text-right
                         [&_table]:w-full [&_table]:border-collapse
-                        [&_th]:border [&_th]:border-gray-300 [&_th]:bg-white [&_th]:px-3 [&_th]:py-2 [&_th]:text-right
-                        [&_td]:border [&_td]:border-gray-300 [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_td]:text-right
-                        [&_tr:nth-child(even)]:bg-white/60
-                        [&_p]:m-0 [&_ul]:my-2 [&_ol]:my-2
+                        [&_th]:border [&_th]:border-white/30 [&_th]:bg-white/10 [&_th]:px-3 [&_th]:py-2 [&_th]:text-right
+                        [&_td]:border [&_td]:border-white/30 [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_td]:text-right
+                        [&_tr:nth-child(even)]:bg-white/5
+                        [&_p]:m-0 [&_p]:text-right
+                        [&_ul]:my-2 [&_ul]:pr-5 [&_ul]:text-right
+                        [&_ol]:my-2 [&_ol]:pr-5 [&_ol]:text-right
+                        [&_li]:text-right
+                        [&_a]:text-white [&_a]:underline
+                        [&_strong]:text-white
+                        [&_code]:bg-white/10 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded
                       "
                     >
                       <div className="overflow-x-auto">
@@ -280,13 +290,12 @@ export function ChatPage() {
                     </p>
                   )}
 
-                  {/* ✅ خيارات اختيار المصدر كأزرار */}
                   {m.sender === "assistant" &&
                     Array.isArray(m.choices) &&
                     m.choices.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-gray-200">
-                        <p className="text-xs font-semibold text-gray-600 mb-2">
-                         : اختر ملف 
+                      <div className="mt-3 pt-3 border-t border-white/20">
+                        <p className="text-xs font-semibold text-white/90 mb-2">
+                          اختر ملف:
                         </p>
 
                         <div className="flex flex-col gap-2">
@@ -295,7 +304,7 @@ export function ChatPage() {
                               key={c.doc_key}
                               type="button"
                               variant="outline"
-                              className="justify-start rounded-xl border-gray-300 bg-white hover:bg-gray-50 text-gray-800"
+                              className="justify-start rounded-xl border-white/30 bg-white text-gray-800 hover:bg-gray-100"
                               disabled={choosing || sending}
                               onClick={() => sendChoice(c.label, c.doc_key)}
                               title={c.label}
@@ -312,12 +321,11 @@ export function ChatPage() {
                       </div>
                     )}
 
-                  {/* Attachments */}
                   {m.sender === "assistant" &&
                     Array.isArray(m.attachments) &&
                     m.attachments.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-gray-200 space-y-2">
-                        <p className="text-xs font-semibold text-gray-600">
+                      <div className="mt-3 pt-3 border-t border-white/20 space-y-2">
+                        <p className="text-xs font-semibold text-white/90">
                           ملفات للتحميل
                         </p>
 
@@ -327,7 +335,7 @@ export function ChatPage() {
                           return (
                             <div
                               key={`${m.id}-att-${idx}`}
-                              className="rounded-xl border border-gray-200 bg-white p-3"
+                              className="rounded-xl border border-white/20 bg-white p-3"
                             >
                               <div className="flex items-start gap-3">
                                 <div className="w-9 h-9 rounded-xl bg-[#E8F5E9] flex items-center justify-center flex-shrink-0">
@@ -371,27 +379,38 @@ export function ChatPage() {
                       </div>
                     )}
 
-                  {/* Sources */}
                   {m.sender === "assistant" &&
                     Array.isArray(m.sources) &&
                     m.sources.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-gray-200">
-                        <p className="text-xs font-semibold text-gray-600 mb-2">
+                      <div className="mt-3 pt-3 border-t border-white/20">
+                        <p className="text-xs font-semibold text-white/90 mb-2">
                           المصادر
                         </p>
                         <div className="flex flex-wrap gap-2">
                           {m.sources.map((s, idx) => (
                             <span
                               key={`${m.id}-src-${idx}`}
-                              className="text-xs bg-white border border-gray-300 text-gray-700 rounded-full px-2 py-1"
-                              title={s}
+                              className="text-xs bg-white text-gray-700 border border-white/20 rounded-full px-2 py-1"
+                              title={s.page ? `${s.name} — صفحة ${s.page}` : s.name}
                             >
-                              {s}
+                              {s.name}
+                              {s.page ? ` — صفحة ${s.page}` : ""}
                             </span>
                           ))}
                         </div>
                       </div>
                     )}
+
+                  {m.sender === "assistant" && m.debug && (
+                    <div className="mt-3 pt-3 border-t border-white/20">
+                      <p className="text-xs font-semibold text-white/90 mb-2">
+                        Debug (RAG)
+                      </p>
+                      <pre className="text-xs bg-black/30 text-white p-3 rounded-lg overflow-x-auto whitespace-pre-wrap text-left dir-ltr">
+                        {m.debug}
+                      </pre>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -400,7 +419,6 @@ export function ChatPage() {
         )}
       </ScrollArea>
 
-      {/* Input */}
       <div className="border-t border-gray-200 p-3 lg:p-4 bg-white sticky bottom-0">
         <div className="max-w-4xl mx-auto flex gap-2">
           <Input
