@@ -1,8 +1,7 @@
-# rag_system.py
 import os
 import re
 import hashlib
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 import chromadb
 from dotenv import load_dotenv
@@ -30,6 +29,11 @@ _RE_TABLE_ID = re.compile(r"^\s*TABLE_ID\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MU
 _RE_MD_SECTION = re.compile(
     r"FORMAT:\s*markdown\s*(.*?)\s*(?:FORMAT:\s*plain|$)",
     re.DOTALL | re.IGNORECASE,
+)
+
+_RE_QUERY_PAGE = re.compile(
+    r"(?:\bpage\b|\bpg\b|الصفحه|الصفحة|صفحه|صفحة|ص)\s*[:\-]?\s*(\d{1,4}|[٠-٩]{1,4})",
+    re.IGNORECASE,
 )
 
 
@@ -190,6 +194,27 @@ def _query_variants(q: str) -> List[str]:
         if x and x not in variants:
             variants.append(x)
     return variants
+
+
+def _extract_page_number_from_query(query: str) -> Optional[int]:
+    q = (query or "").strip()
+    if not q:
+        return None
+    m = _RE_QUERY_PAGE.search(q)
+    if not m:
+        return None
+    try:
+        return int(_normalize_digits(m.group(1)))
+    except Exception:
+        return None
+
+
+def _tokenize_for_match(text: str) -> List[str]:
+    t = _normalize_ar(_normalize_digits(text or ""))
+    if not t:
+        return []
+    toks = re.findall(r"[a-z0-9]+|[\u0600-\u06FF]+", t)
+    return [x for x in toks if len(x) >= 2]
 
 
 class RAGSystem:
@@ -406,6 +431,17 @@ class RAGSystem:
                     md["article_no"] = article_no
                     md["article_no_norm"] = _normalize_ar(article_no)
 
+                # normalize page_number if present
+                if md.get("page_number") is not None:
+                    try:
+                        md["page_number"] = int(_normalize_digits(str(md.get("page_number"))))
+                    except Exception:
+                        md.pop("page_number", None)
+
+                # normalize page_content if present
+                if md.get("page_content") is not None:
+                    md["page_content"] = str(md.get("page_content") or "").strip()[:4000]
+
                 # استخراج article_no تلقائياً من النص إذا غير موجود
                 if not md.get("article_no"):
                     auto_article = _extract_article_no_from_chunk(chunk_text)
@@ -534,6 +570,85 @@ class RAGSystem:
         return out
 
     # =========================================================
+    # Ranking helpers
+    # =========================================================
+    def _text_overlap_score(self, query: str, text: str) -> float:
+        q_tokens = _tokenize_for_match(query)
+        if not q_tokens:
+            return 0.0
+
+        blob = _normalize_ar(_normalize_digits(text or ""))
+        if not blob:
+            return 0.0
+
+        matched = 0
+        for tok in q_tokens[:10]:
+            if tok in blob:
+                matched += 1
+
+        return matched / max(1, min(len(q_tokens), 10))
+
+    def _rerank_hit(self, query: str, hit: Dict[str, Any]) -> Tuple[float, float, float, int]:
+        """
+        smaller tuple is better
+        """
+        meta = hit.get("metadata") or {}
+        base_score = hit.get("score")
+        try:
+            base_score_f = float(base_score) if base_score is not None else 1e9
+        except Exception:
+            base_score_f = 1e9
+
+        page_number = meta.get("page_number")
+        try:
+            page_number = int(page_number) if page_number is not None else None
+        except Exception:
+            page_number = None
+
+        requested_page = _extract_page_number_from_query(query)
+
+        page_content = str(meta.get("page_content") or "")
+        content = str(hit.get("content") or "")
+        article_no = str(meta.get("article_no") or "")
+
+        overlap_chunk = self._text_overlap_score(query, content)
+        overlap_page = self._text_overlap_score(query, page_content)
+        overlap_article = self._text_overlap_score(query, article_no)
+
+        boost = 0.0
+
+        # page match boost
+        if requested_page is not None and page_number is not None:
+            if requested_page == page_number:
+                boost += 0.18
+            else:
+                # لو السؤال ذكر صفحة مختلفة، نعطي عقوبة خفيفة
+                boost -= 0.03
+
+        # page content boost
+        boost += overlap_page * 0.12
+
+        # direct chunk overlap boost
+        boost += overlap_chunk * 0.08
+
+        # article boost
+        boost += overlap_article * 0.08
+
+        # وجود page_number بحد ذاته ممتاز للـ PDF chunks
+        if page_number is not None:
+            boost += 0.01
+
+        effective_score = base_score_f - boost
+
+        try:
+            chunk_index = int(meta.get("chunk_index") or 0)
+        except Exception:
+            chunk_index = 0
+
+        doc_key = str(meta.get("doc_key") or "")
+        return (effective_score, base_score_f, page_number or 0, chunk_index)
+
+    # =========================================================
     # Semantic search ONLY
     # =========================================================
     def search(
@@ -555,8 +670,10 @@ class RAGSystem:
         if not variants:
             return []
 
-        where_candidates: List[Optional[Dict[str, Any]]] = [where]
+        # نجيب عدد أكبر قليلًا ثم نعيد الترتيب
+        fetch_k = max(top_k * 3, 20)
 
+        where_candidates: List[Optional[Dict[str, Any]]] = [where]
         collected: List[Dict[str, Any]] = []
 
         def _run_query(qq: str, w: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -567,7 +684,7 @@ class RAGSystem:
 
             results = self.collection.query(
                 query_embeddings=[q_emb],
-                n_results=top_k,
+                n_results=fetch_k,
                 where=w,
                 include=["documents", "metadatas", "distances"],
             )
@@ -623,7 +740,8 @@ class RAGSystem:
             seen.add(key)
             uniq.append(it)
 
-        uniq.sort(key=lambda x: (x.get("score") is None, x.get("score", 1e9)))
+        # rerank here
+        uniq.sort(key=lambda x: self._rerank_hit(q, x))
         top_hits = uniq[:top_k]
 
         if not include_neighbors:
@@ -651,19 +769,9 @@ class RAGSystem:
             seen2.add(key)
             final.append(it)
 
-        def _sort_key(x):
-            m = x.get("metadata") or {}
-            dk = str(m.get("doc_key") or "")
-            try:
-                ci = int(m.get("chunk_index") or 0)
-            except Exception:
-                ci = 0
-            sc = x.get("score")
-            sc2 = sc if isinstance(sc, (int, float)) else 1e9
-            return (sc2, dk, ci)
+        final.sort(key=lambda x: self._rerank_hit(q, x))
+        return final[: max(top_k, len(top_hits))]
 
-        final.sort(key=_sort_key)
-        return final
 
 
 # =========================================================

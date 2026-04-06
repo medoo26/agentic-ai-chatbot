@@ -1,4 +1,3 @@
-# document_processor.py
 import os
 import re
 import inspect
@@ -147,10 +146,118 @@ class DocumentProcessor:
         x = re.sub(r"(?is)<br\s*/?>", "\n", x)
         x = re.sub(r"(?is)</p\s*>", "\n\n", x)
         x = re.sub(r"(?is)</h[1-6]\s*>", "\n", x)
+        x = re.sub(r"(?is)</td\s*>", " | ", x)
+        x = re.sub(r"(?is)</th\s*>", " | ", x)
+        x = re.sub(r"(?is)</tr\s*>", "\n", x)
         x = re.sub(r"(?is)<[^>]+>", " ", x)
         x = re.sub(r"[ \t]+", " ", x)
         x = re.sub(r"\n{3,}", "\n\n", x)
         return x.strip()
+
+    # =========================================================
+    # Header / Footer removal helpers
+    # =========================================================
+    def _is_page_number_line(self, line: str) -> bool:
+        s = (line or "").strip()
+        if not s:
+            return False
+
+        s = s.replace("الصفحة", "").replace("صفحة", "").strip()
+        s = s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+
+        return bool(re.fullmatch(r"\d{1,4}", s))
+
+    def _normalize_header_footer_line(self, line: str) -> str:
+        s = (line or "").strip()
+        if not s:
+            return ""
+
+        s = s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+        s = re.sub(r"\d+", "#", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _collect_repeated_edge_lines(
+        self,
+        pdf_pages: List[Dict[str, Any]],
+        edge_line_count: int = 3,
+        min_repeat: int = 2,
+    ) -> Tuple[set, set]:
+        """
+        يجمع السطور المتكررة في أعلى وأسفل الصفحات لاستخدامها كهيدر/فوتر.
+        """
+        from collections import Counter
+
+        top_counter = Counter()
+        bottom_counter = Counter()
+
+        for page in pdf_pages or []:
+            text = (page.get("text") or "").strip()
+            if not text:
+                continue
+
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                continue
+
+            top_lines = lines[:edge_line_count]
+            bottom_lines = lines[-edge_line_count:]
+
+            for ln in top_lines:
+                norm = self._normalize_header_footer_line(ln)
+                if norm and len(norm) >= 2:
+                    top_counter[norm] += 1
+
+            for ln in bottom_lines:
+                norm = self._normalize_header_footer_line(ln)
+                if norm and len(norm) >= 2:
+                    bottom_counter[norm] += 1
+
+        repeated_top = {k for k, v in top_counter.items() if v >= min_repeat}
+        repeated_bottom = {k for k, v in bottom_counter.items() if v >= min_repeat}
+
+        return repeated_top, repeated_bottom
+
+    def _remove_header_footer_from_page_text(
+        self,
+        text: str,
+        repeated_top: set,
+        repeated_bottom: set,
+        edge_line_count: int = 3,
+    ) -> str:
+        if not text:
+            return ""
+
+        lines = [ln.rstrip() for ln in text.splitlines()]
+        if not lines:
+            return ""
+
+        cleaned = []
+
+        for idx, line in enumerate(lines):
+            raw = (line or "").strip()
+            if not raw:
+                continue
+
+            norm = self._normalize_header_footer_line(raw)
+
+            # إزالة أرقام الصفحات المنفصلة
+            if self._is_page_number_line(raw):
+                continue
+
+            # إزالة الهيدر المتكرر من أعلى الصفحة فقط
+            if idx < edge_line_count and norm in repeated_top:
+                continue
+
+            # إزالة الفوتر المتكرر من أسفل الصفحة فقط
+            if idx >= max(0, len(lines) - edge_line_count) and norm in repeated_bottom:
+                continue
+
+            cleaned.append(raw)
+
+        out = "\n".join(cleaned)
+        out = self._clean_text_keep_tables(out)
+        return out
 
     # =========================================================
     # ✅ Split BODY by H1/H2/H3 only
@@ -336,9 +443,17 @@ class DocumentProcessor:
                         continue
 
                     inner = self._strip_outer_html(out or "")
+                    if inner and page_number is not None:
+                        inner = (
+                            f'<div class="page-block" data-page="{int(page_number)}">\n'
+                            f'{inner}\n'
+                            f"</div>"
+                        )
+
                     if inner:
                         html_units.append({
                             "page_number": page_number,
+                            "page_text": page_text,
                             "html": inner,
                         })
 
@@ -372,6 +487,7 @@ class DocumentProcessor:
                     if inner:
                         html_units.append({
                             "page_number": None,
+                            "page_text": seg,
                             "html": inner,
                         })
 
@@ -390,7 +506,7 @@ class DocumentProcessor:
 
             # =========================================================
             # Prepare chunks for indexing
-            # PDF: each page html = chunk with page_number
+            # PDF: each page html = chunk with page_number + page_content
             # Others: split by H1/H2/H3, no page number
             # =========================================================
             chunks_to_index: List[Dict[str, Any]] = []
@@ -400,9 +516,11 @@ class DocumentProcessor:
                     chunk_html = (unit.get("html") or "").strip()
                     if not chunk_html:
                         continue
+
                     chunks_to_index.append({
                         "html": chunk_html,
                         "page_number": unit.get("page_number"),
+                        "page_content": (unit.get("page_text") or "").strip(),
                     })
                 print(f"🧩 PDF chunks produced: {len(chunks_to_index)}")
             else:
@@ -413,9 +531,13 @@ class DocumentProcessor:
                     chunk_html = (chunk_html or "").strip()
                     if not chunk_html:
                         continue
+
+                    chunk_plain_tmp = self._html_to_plain(chunk_html)
+
                     chunks_to_index.append({
                         "html": chunk_html,
                         "page_number": None,
+                        "page_content": chunk_plain_tmp[:2000] if chunk_plain_tmp else "",
                     })
 
             if not chunks_to_index:
@@ -442,8 +564,13 @@ class DocumentProcessor:
                     chunk_meta["html"] = chunk_html
 
                     page_number = item.get("page_number")
+                    page_content = (item.get("page_content") or "").strip()
+
                     if page_number is not None:
                         chunk_meta["page_number"] = int(page_number)
+
+                    if page_content:
+                        chunk_meta["page_content"] = page_content[:4000]
 
                     self.rag_system.add_document(
                         content=chunk_plain,
@@ -494,20 +621,20 @@ class DocumentProcessor:
 
     def _process_pdf_pages(self, file_path: str) -> List[Dict[str, Any]]:
         reader = PdfReader(file_path)
-        pages: List[Dict[str, Any]] = []
+        raw_pages: List[Dict[str, Any]] = []
 
         for i, page in enumerate(reader.pages, start=1):
             extracted = page.extract_text() or ""
             cleaned = self._clean_text_keep_tables(extracted)
 
             if cleaned.strip():
-                pages.append({
+                raw_pages.append({
                     "page_number": i,
                     "text": cleaned,
                 })
 
         # OCR fallback only if no extracted pages found
-        if self.enable_ocr and not pages:
+        if self.enable_ocr and not raw_pages:
             ocr = self._try_import_ocr()
             if ocr:
                 pytesseract, _Image, convert_from_path = ocr
@@ -517,12 +644,35 @@ class DocumentProcessor:
                         ocr_text = pytesseract.image_to_string(img, lang="ara+eng")
                         cleaned = self._clean_text_keep_tables(ocr_text)
                         if cleaned.strip():
-                            pages.append({
+                            raw_pages.append({
                                 "page_number": i,
                                 "text": cleaned,
                             })
                 except Exception as e:
                     print("⚠️ PDF OCR failed:", e)
+
+        if not raw_pages:
+            return []
+
+        repeated_top, repeated_bottom = self._collect_repeated_edge_lines(
+            raw_pages,
+            edge_line_count=3,
+            min_repeat=2,
+        )
+
+        pages: List[Dict[str, Any]] = []
+        for page in raw_pages:
+            cleaned_page = self._remove_header_footer_from_page_text(
+                page.get("text") or "",
+                repeated_top=repeated_top,
+                repeated_bottom=repeated_bottom,
+                edge_line_count=3,
+            )
+            if cleaned_page.strip():
+                pages.append({
+                    "page_number": page.get("page_number"),
+                    "text": cleaned_page,
+                })
 
         return pages
 
