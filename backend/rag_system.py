@@ -1,11 +1,35 @@
 import os
 import re
 import hashlib
+import logging
 from typing import List, Dict, Optional, Any, Tuple
 
+# Disable Chroma anonymized telemetry early to avoid noisy capture() warnings.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "chromadb.telemetry.product.noop.Noop")
+os.environ.setdefault("POSTHOG_DISABLED", "1")
+
 import chromadb
+from chromadb.config import Settings
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+try:
+    from rank_bm25 import BM25Okapi
+except Exception:
+    BM25Okapi = None
+
+# Quiet noisy Chroma telemetry/index logs.
+for _lg in [
+    "chromadb",
+    "chromadb.telemetry",
+    "chromadb.telemetry.product",
+    "chromadb.segment",
+    "chromadb.segment.impl.vector.local_persistent_hnsw",
+]:
+    try:
+        logging.getLogger(_lg).setLevel(logging.ERROR)
+    except Exception:
+        pass
 
 # OpenAI embeddings (اختياري)
 try:
@@ -223,22 +247,35 @@ class RAGSystem:
         self.vector_store_path = os.getenv("VECTOR_STORE_PATH", "./vector_store")
 
         # مهم: لا تستخدم نفس collection القديمة مع موديل جديد
-        self.collection_name = os.getenv("CHROMA_COLLECTION", "university_docs_e5_v1")
+        self.collection_name = os.getenv("CHROMA_COLLECTION", "university_docs_legal_v2")
 
         self.embedding_mode = (os.getenv("EMBEDDING_MODE", "local") or "local").strip().lower()
         if self.embedding_mode not in ("local", "openai"):
             self.embedding_mode = "local"
 
         self.force_e5 = (os.getenv("FORCE_E5", "0").strip() == "1")
+        self.hybrid_enabled = (os.getenv("RAG_HYBRID_ENABLED", "1").strip() == "1")
+        self.hybrid_dense_top_k = int(os.getenv("RAG_HYBRID_DENSE_TOP_K", "40"))
+        self.hybrid_bm25_top_k = int(os.getenv("RAG_HYBRID_BM25_TOP_K", "40"))
+        self.rrf_k = int(os.getenv("RAG_RRF_K", "60"))
 
         self.embed_mode: Optional[str] = None
         self.openai_embeddings = None
         self.local_model = None
         self.local_model_name: str = ""
+        self.lexical_enabled = BM25Okapi is not None
+        self._lexical_ready = False
+        self._lexical_count = -1
+        self._lexical_docs: List[Dict[str, Any]] = []
+        self._lexical_corpus_tokens: List[List[str]] = []
+        self._lexical_bm25 = None
 
         self._init_embeddings()
 
-        self.client = chromadb.PersistentClient(path=self.vector_store_path)
+        self.client = chromadb.PersistentClient(
+            path=self.vector_store_path,
+            settings=Settings(anonymized_telemetry=False),
+        )
         self.collection = self.client.get_or_create_collection(name=self.collection_name)
 
         try:
@@ -340,6 +377,7 @@ class RAGSystem:
             return
         try:
             self.collection.delete(where={"doc_key": dk})
+            self._lexical_ready = False
         except Exception as e:
             print("⚠️ delete_doc_key failed:", e)
 
@@ -442,6 +480,20 @@ class RAGSystem:
                 if md.get("page_content") is not None:
                     md["page_content"] = str(md.get("page_content") or "").strip()[:4000]
 
+                # normalize legal hierarchy metadata
+                for k in ["level_1", "level_2", "article", "header_path", "parent_header_path", "section_type"]:
+                    if md.get(k) is not None:
+                        md[k] = str(md.get(k) or "").strip()
+
+                # normalize table metadata
+                md["is_table"] = bool(md.get("is_table"))
+                if md.get("table_id") is not None:
+                    md["table_id"] = str(md.get("table_id") or "").strip()
+                if md.get("table_text") is not None:
+                    md["table_text"] = str(md.get("table_text") or "").strip()[:8000]
+                if md.get("table_schema") is not None:
+                    md["table_schema"] = str(md.get("table_schema") or "").strip()[:2000]
+
                 # استخراج article_no تلقائياً من النص إذا غير موجود
                 if not md.get("article_no"):
                     auto_article = _extract_article_no_from_chunk(chunk_text)
@@ -460,19 +512,200 @@ class RAGSystem:
                 print("❌ Embedding failed; skipping indexing.")
                 continue
 
-            try:
-                self.collection.delete(ids=ids)
-            except Exception:
-                pass
-
             self.collection.add(
                 documents=docs,
                 ids=ids,
                 embeddings=embs,
                 metadatas=metadatas_list,
             )
+            self._lexical_ready = False
 
             print(f"✅ Indexed/Upserted {len(docs)} chunks for doc_key={doc_key} (mode={self.embed_mode})")
+
+    def _hit_key(self, it: Dict[str, Any]) -> str:
+        meta = it.get("metadata") or {}
+        dk = str(meta.get("doc_key") or "")
+        ci = str(meta.get("chunk_index") or "")
+        h = hashlib.md5((it.get("content") or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
+        return f"{dk}:{ci}:{h}"
+
+    def _normalize_page_number(self, page_number: Any) -> Optional[int]:
+        try:
+            return int(page_number) if page_number is not None else None
+        except Exception:
+            return None
+
+    def _where_matches(self, meta: Dict[str, Any], where: Optional[Dict[str, Any]]) -> bool:
+        if not where:
+            return True
+        if "$and" in where:
+            clauses = where.get("$and") or []
+            return all(self._where_matches(meta, c) for c in clauses)
+        if "$or" in where:
+            clauses = where.get("$or") or []
+            return any(self._where_matches(meta, c) for c in clauses)
+        for k, v in where.items():
+            if k.startswith("$"):
+                continue
+            if str(meta.get(k)) != str(v):
+                return False
+        return True
+
+    def _lexical_blob(self, content: str, meta: Dict[str, Any]) -> str:
+        fields = [
+            content or "",
+            str(meta.get("article_no") or ""),
+            str(meta.get("article") or ""),
+            str(meta.get("level_1") or ""),
+            str(meta.get("level_2") or ""),
+            str(meta.get("header_path") or ""),
+            str(meta.get("parent_header_path") or ""),
+            str(meta.get("original_name") or meta.get("filename") or ""),
+            str(meta.get("section_type") or ""),
+            str(meta.get("table_text") or ""),
+        ]
+        return "\n".join([x for x in fields if x]).strip()
+
+    def _build_lexical_index_if_needed(self) -> None:
+        if not self.lexical_enabled:
+            return
+        try:
+            coll_count = int(self.collection.count() or 0)
+        except Exception:
+            coll_count = 0
+        if coll_count <= 0:
+            self._lexical_docs = []
+            self._lexical_corpus_tokens = []
+            self._lexical_bm25 = None
+            self._lexical_count = 0
+            self._lexical_ready = True
+            return
+        if self._lexical_ready and self._lexical_count == coll_count and self._lexical_bm25 is not None:
+            return
+        try:
+            rows = self.collection.get(include=["documents", "metadatas"])
+            docs = rows.get("documents") or []
+            metas = rows.get("metadatas") or []
+        except Exception as e:
+            print(f"⚠️ lexical index build failed: {e}")
+            return
+
+        payload: List[Dict[str, Any]] = []
+        corpus_tokens: List[List[str]] = []
+        for doc, meta in zip(docs, metas):
+            txt = (doc or "").strip()
+            if not txt:
+                continue
+            mm = meta or {}
+            blob = self._lexical_blob(txt, mm)
+            toks = _tokenize_for_match(blob)
+            if not toks:
+                continue
+            payload.append(
+                {
+                    "content": txt,
+                    "metadata": mm,
+                    "page_number": self._normalize_page_number(mm.get("page_number")),
+                }
+            )
+            corpus_tokens.append(toks)
+        if not payload:
+            self._lexical_docs = []
+            self._lexical_corpus_tokens = []
+            self._lexical_bm25 = None
+            self._lexical_count = coll_count
+            self._lexical_ready = True
+            return
+        try:
+            self._lexical_bm25 = BM25Okapi(corpus_tokens)
+            self._lexical_docs = payload
+            self._lexical_corpus_tokens = corpus_tokens
+            self._lexical_count = coll_count
+            self._lexical_ready = True
+        except Exception as e:
+            print(f"⚠️ BM25 init failed: {e}")
+            self._lexical_bm25 = None
+            self._lexical_ready = False
+
+    def _lexical_search(self, query: str, top_k: int, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        if not self.lexical_enabled:
+            return []
+        self._build_lexical_index_if_needed()
+        if self._lexical_bm25 is None or not self._lexical_docs:
+            return []
+        q_toks = _tokenize_for_match(query)
+        if not q_toks:
+            return []
+        try:
+            scores = self._lexical_bm25.get_scores(q_toks)
+        except Exception:
+            return []
+        scored: List[Tuple[int, float]] = []
+        for idx, sc in enumerate(scores):
+            if sc is None:
+                continue
+            try:
+                score_f = float(sc)
+            except Exception:
+                continue
+            if score_f <= 0:
+                continue
+            hit = self._lexical_docs[idx]
+            if where and not self._where_matches(hit.get("metadata") or {}, where):
+                continue
+            scored.append((idx, score_f))
+        if not scored:
+            return []
+        scored.sort(key=lambda x: x[1], reverse=True)
+        out: List[Dict[str, Any]] = []
+        for idx, score_f in scored[: max(1, top_k)]:
+            rec = self._lexical_docs[idx]
+            out.append(
+                {
+                    "content": rec.get("content") or "",
+                    "metadata": rec.get("metadata") or {},
+                    "score": 1.0 / (1.0 + score_f),
+                    "matched_query": query,
+                    "page_number": rec.get("page_number"),
+                    "_lexical_score": score_f,
+                }
+            )
+        return out
+
+    def _fuse_rrf(
+        self,
+        dense_hits: List[Dict[str, Any]],
+        lexical_hits: List[Dict[str, Any]],
+        rrf_k: int,
+    ) -> List[Dict[str, Any]]:
+        if not dense_hits and not lexical_hits:
+            return []
+        dense_ranked = sorted(dense_hits, key=lambda x: self._rerank_hit(str(x.get("matched_query") or ""), x))
+        lexical_ranked = sorted(lexical_hits, key=lambda x: float(x.get("score") or 1e9))
+        fused: Dict[str, Dict[str, Any]] = {}
+        rrf_scores: Dict[str, float] = {}
+        denom_k = max(1, int(rrf_k))
+
+        for rank, hit in enumerate(dense_ranked, start=1):
+            key = self._hit_key(hit)
+            fused[key] = hit
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + (1.0 / (denom_k + rank))
+
+        for rank, hit in enumerate(lexical_ranked, start=1):
+            key = self._hit_key(hit)
+            if key not in fused:
+                fused[key] = hit
+            rrf_scores[key] = rrf_scores.get(key, 0.0) + (1.0 / (denom_k + rank))
+
+        out: List[Dict[str, Any]] = []
+        for key, hit in fused.items():
+            rrf_score = float(rrf_scores.get(key, 0.0))
+            rec = dict(hit)
+            rec["_rrf_score"] = rrf_score
+            rec["score"] = 1.0 / (rrf_score + 1e-9)
+            out.append(rec)
+        out.sort(key=lambda x: float(x.get("score") or 1e9))
+        return out
 
     # =========================================================
     # Neighbor helpers
@@ -649,7 +882,7 @@ class RAGSystem:
         return (effective_score, base_score_f, page_number or 0, chunk_index)
 
     # =========================================================
-    # Semantic search ONLY
+    # Hybrid search (dense + lexical BM25 + RRF)
     # =========================================================
     def search(
         self,
@@ -670,11 +903,12 @@ class RAGSystem:
         if not variants:
             return []
 
-        # نجيب عدد أكبر قليلًا ثم نعيد الترتيب
-        fetch_k = max(top_k * 3, 20)
+        fetch_k = max(top_k * 3, self.hybrid_dense_top_k, 20)
+        bm25_fetch_k = max(top_k * 3, self.hybrid_bm25_top_k, 20)
 
         where_candidates: List[Optional[Dict[str, Any]]] = [where]
-        collected: List[Dict[str, Any]] = []
+        dense_collected: List[Dict[str, Any]] = []
+        lexical_collected: List[Dict[str, Any]] = []
 
         def _run_query(qq: str, w: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
             out_local: List[Dict[str, Any]] = []
@@ -682,12 +916,33 @@ class RAGSystem:
             if q_emb is None:
                 return out_local
 
-            results = self.collection.query(
-                query_embeddings=[q_emb],
-                n_results=fetch_k,
-                where=w,
-                include=["documents", "metadatas", "distances"],
-            )
+            try:
+                coll_count = int(self.collection.count() or 0)
+            except Exception:
+                coll_count = 0
+            if coll_count <= 0:
+                return out_local
+
+            n_results = min(fetch_k, coll_count, 50)
+            if n_results <= 0:
+                return out_local
+
+            try:
+                results = self.collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=n_results,
+                    where=w,
+                    include=["documents", "metadatas", "distances"],
+                )
+            except Exception:
+                # Some HNSW setups fail on larger n_results; retry with smaller safe k.
+                retry_k = min(max(top_k, 5), coll_count, 20)
+                results = self.collection.query(
+                    query_embeddings=[q_emb],
+                    n_results=retry_k,
+                    where=w,
+                    include=["documents", "metadatas", "distances"],
+                )
 
             docs = (results.get("documents") or [[]])[0]
             metas = (results.get("metadatas") or [[]])[0]
@@ -719,9 +974,18 @@ class RAGSystem:
         for w in where_candidates:
             for qq in variants:
                 try:
-                    collected.extend(_run_query(qq, w))
+                    dense_collected.extend(_run_query(qq, w))
                 except Exception as e:
                     print(f"❌ Search Error: {e}")
+                if self.hybrid_enabled:
+                    try:
+                        lexical_collected.extend(self._lexical_search(qq, top_k=bm25_fetch_k, where=w))
+                    except Exception as e:
+                        print(f"⚠️ Lexical search error: {e}")
+
+        collected = dense_collected
+        if self.hybrid_enabled and lexical_collected:
+            collected = self._fuse_rrf(dense_collected, lexical_collected, self.rrf_k)
 
         if not collected:
             return []
@@ -730,11 +994,7 @@ class RAGSystem:
         seen = set()
         uniq: List[Dict[str, Any]] = []
         for it in collected:
-            meta = it.get("metadata") or {}
-            dk = str(meta.get("doc_key") or "")
-            ci = str(meta.get("chunk_index") or "")
-            h = hashlib.md5((it.get("content") or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
-            key = f"{dk}:{ci}:{h}"
+            key = self._hit_key(it)
             if key in seen:
                 continue
             seen.add(key)

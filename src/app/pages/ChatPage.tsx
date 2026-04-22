@@ -3,13 +3,14 @@ import { useNavigate } from "react-router-dom";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { ScrollArea } from "../components/ui/scroll-area";
-import { Send, LogOut, Plus, Bot, Download, FileText } from "lucide-react";
+import { Dialog, DialogContent } from "../components/ui/dialog";
+import { ArrowUp, LogOut, Plus, Bot, Download, FileText, Eye } from "lucide-react";
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 // API
-import { apiPost, API_BASE_URL } from "../../api";
+import { apiPostChatStream, API_BASE_URL, type ChatStreamMeta } from "../../api";
 
 type Attachment = {
   name: string;
@@ -26,17 +27,9 @@ type ChoiceItem = {
 type SourceItem = {
   name: string;
   page?: number | null;
-};
-
-type ApiMessage = {
-  id: number;
-  content: string;
-  sender: "user" | "assistant";
-  timestamp: string;
-  sources?: SourceItem[];
-  attachments?: Attachment[];
-  choices?: ChoiceItem[];
-  debug?: string;
+  public_id?: string | null;
+  url?: string | null;
+  mime?: string | null;
 };
 
 type UIMessage = {
@@ -57,22 +50,32 @@ export function ChatPage() {
   const [inputMessage, setInputMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [choosing, setChoosing] = useState(false);
+  const [streaming, setStreaming] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewSource, setPreviewSource] = useState<SourceItem | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeStreamRef = useRef<AbortController | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages.length]);
+    const id = window.requestAnimationFrame(() => {
+      scrollToBottom();
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [messages]);
 
   const handleLogout = () => navigate("/");
 
   const createNewChat = () => {
+    activeStreamRef.current?.abort();
+    activeStreamRef.current = null;
     setMessages([]);
     setInputMessage("");
+    setStreaming(false);
   };
 
   const toAbsoluteUrl = (url: string) => {
@@ -81,9 +84,51 @@ export function ChatPage() {
     return `${API_BASE_URL}${url.startsWith("/") ? url : `/${url}`}`;
   };
 
+  const cleanAssistantContent = (content: string) => {
+    const text = String(content || "");
+    // Hide internal source-title marker if the model emits it.
+    return text
+      .replace(/\n?\s*SOURCES_TITLES_JSON:\s*\[[^\]]*\]\s*$/gim, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trimEnd();
+  };
+
+  const formatSourceName = (name: string) => {
+    const value = String(name || "").trim();
+    return value.replace(/\.(pdf|docx|doc|txt|xlsx|xls|pptx|ppt)$/i, "");
+  };
+
+  const getSourcePreviewUrl = (source: SourceItem) => {
+    const rawUrl = String(source?.url || "").trim();
+    if (rawUrl) {
+      const absolute = toAbsoluteUrl(rawUrl);
+      if (source?.page && Number(source.page) > 0) {
+        return `${absolute}#page=${source.page}`;
+      }
+      return absolute;
+    }
+    const pid = String(source?.public_id || "").trim();
+    if (!pid) return "";
+    const absolute = toAbsoluteUrl(`/api/files/${pid}/preview`);
+    if (source?.page && Number(source.page) > 0) {
+      return `${absolute}#page=${source.page}`;
+    }
+    return absolute;
+  };
+
+  const openSourcePreview = (source: SourceItem) => {
+    const mime = String(source?.mime || "").toLowerCase();
+    const isPdf = !mime || mime.includes("pdf");
+    const previewUrl = getSourcePreviewUrl(source);
+    if (!isPdf || !previewUrl) return;
+    setPreviewSource(source);
+    setPreviewOpen(true);
+  };
+
   const sendMessage = async (content: string) => {
-    if (!content.trim() || sending || choosing) return;
+    if (!content.trim() || sending || choosing || streaming) return;
     setSending(true);
+    setStreaming(true);
 
     const userMsg: UIMessage = {
       id: `u-${Date.now()}`,
@@ -98,43 +143,68 @@ export function ChatPage() {
 
     setMessages((prev) => [...prev, userMsg]);
     setInputMessage("");
-
-    try {
-      const ai = await apiPost<ApiMessage>("/api/chat", { content });
-
-      const aiMsg: UIMessage = {
-        id: `a-${ai.id}-${Date.now()}`,
-        content: ai.content,
-        sender: ai.sender,
-        timestamp: new Date(ai.timestamp),
-        sources: Array.isArray(ai.sources) ? ai.sources : [],
-        attachments: Array.isArray(ai.attachments) ? ai.attachments : [],
-        choices: Array.isArray(ai.choices) ? ai.choices : [],
-        debug: ai.debug || "",
-      };
-
-      setMessages((prev) => [...prev, aiMsg]);
-    } catch (err: any) {
-      const errMsg: UIMessage = {
-        id: `err-${Date.now()}`,
-        content: `صار خطأ: ${err?.message || "غير معروف"}`,
+    const assistantId = `a-stream-${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        content: "",
         sender: "assistant",
         timestamp: new Date(),
         sources: [],
         attachments: [],
         choices: [],
         debug: "",
-      };
-      setMessages((prev) => [...prev, errMsg]);
+      },
+    ]);
+
+    const controller = new AbortController();
+    activeStreamRef.current = controller;
+
+    try {
+      await apiPostChatStream("/api/chat/stream", { content }, {
+        signal: controller.signal,
+        onToken: (delta) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, content: `${m.content || ""}${delta}` } : m
+            )
+          );
+        },
+        onMeta: (meta: ChatStreamMeta) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    timestamp: meta?.timestamp ? new Date(meta.timestamp) : m.timestamp,
+                    sources: Array.isArray(meta?.sources) ? meta.sources : [],
+                    attachments: Array.isArray(meta?.attachments) ? meta.attachments : [],
+                    choices: Array.isArray(meta?.choices) ? meta.choices : [],
+                    debug: meta?.debug || "",
+                  }
+                : m
+            )
+          );
+        },
+      });
+    } catch (err: any) {
+      const message = `صار خطأ: ${err?.message || "غير معروف"}`;
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, content: m.content || message } : m))
+      );
     } finally {
+      activeStreamRef.current = null;
+      setStreaming(false);
       setSending(false);
     }
   };
 
   const sendChoice = async (label: string, doc_key: string) => {
-    if (!label || !doc_key || sending || choosing) return;
+    if (!label || !doc_key || sending || choosing || streaming) return;
 
     setChoosing(true);
+    setStreaming(true);
 
     const userMsg: UIMessage = {
       id: `u-choice-${Date.now()}`,
@@ -147,43 +217,68 @@ export function ChatPage() {
       debug: "",
     };
     setMessages((prev) => [...prev, userMsg]);
-
-    try {
-      const ai = await apiPost<ApiMessage>("/api/chat", {
-        content: label,
-        choice_doc_key: doc_key,
-      });
-
-      const aiMsg: UIMessage = {
-        id: `a-${ai.id}-${Date.now()}`,
-        content: ai.content,
-        sender: ai.sender,
-        timestamp: new Date(ai.timestamp),
-        sources: Array.isArray(ai.sources) ? ai.sources : [],
-        attachments: Array.isArray(ai.attachments) ? ai.attachments : [],
-        choices: Array.isArray(ai.choices) ? ai.choices : [],
-        debug: ai.debug || "",
-      };
-
-      setMessages((prev) => [...prev, aiMsg]);
-    } catch (err: any) {
-      const errMsg: UIMessage = {
-        id: `err-${Date.now()}`,
-        content: `صار خطأ: ${err?.message || "غير معروف"}`,
+    const assistantId = `a-choice-stream-${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        content: "",
         sender: "assistant",
         timestamp: new Date(),
         sources: [],
         attachments: [],
         choices: [],
         debug: "",
-      };
-      setMessages((prev) => [...prev, errMsg]);
+      },
+    ]);
+    const controller = new AbortController();
+    activeStreamRef.current = controller;
+
+    try {
+      await apiPostChatStream(
+        "/api/chat/stream",
+        { content: label, choice_doc_key: doc_key },
+        {
+          signal: controller.signal,
+          onToken: (delta) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, content: `${m.content || ""}${delta}` } : m
+              )
+            );
+          },
+          onMeta: (meta: ChatStreamMeta) => {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      timestamp: meta?.timestamp ? new Date(meta.timestamp) : m.timestamp,
+                      sources: Array.isArray(meta?.sources) ? meta.sources : [],
+                      attachments: Array.isArray(meta?.attachments) ? meta.attachments : [],
+                      choices: Array.isArray(meta?.choices) ? meta.choices : [],
+                      debug: meta?.debug || "",
+                    }
+                  : m
+              )
+            );
+          },
+        }
+      );
+    } catch (err: any) {
+      const message = `صار خطأ: ${err?.message || "غير معروف"}`;
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, content: m.content || message } : m))
+      );
     } finally {
+      activeStreamRef.current = null;
+      setStreaming(false);
       setChoosing(false);
     }
   };
 
   return (
+    <>
     <div className="h-dvh flex flex-col bg-white overflow-hidden" dir="rtl">
       <div className="bg-white border-b border-gray-200 p-3 lg:p-4 shadow-sm">
         <div className="flex items-center justify-between gap-3">
@@ -237,55 +332,46 @@ export function ChatPage() {
             {messages.map((m) => (
               <div
                 key={m.id}
-                className={`flex ${
-                  m.sender === "user" ? "justify-end" : "justify-start"
-                }`}
+                className="flex justify-end"
               >
                 <div
-                  className={`w-fit max-w-[85%] sm:max-w-[70%] rounded-2xl p-4 break-words whitespace-pre-wrap ${
+                  className={`w-fit max-w-[85%] sm:max-w-[70%] rounded-2xl p-4 break-words whitespace-pre-wrap text-right ${
                     m.sender === "assistant"
-                      ? "bg-[#2E7D32] text-white"
+                      ? "bg-transparent text-black p-0 rounded-none"
                       : "bg-gray-100 text-gray-800 border border-gray-200"
                   }`}
+                  dir="rtl"
                 >
-                  {m.sender === "assistant" && (
-                    <div className="flex items-center gap-2 mb-2">
-                      <div className="w-6 h-6 bg-white/20 rounded-full flex items-center justify-center">
-                        <Bot className="w-4 h-4 text-white" />
-                      </div>
-                      <span className="text-xs font-semibold text-white">
-                        المساعد الذكي
-                      </span>
-                    </div>
-                  )}
-
                   {m.sender === "assistant" ? (
                     <div
                       dir="rtl"
                       className="
-                        text-sm leading-relaxed break-words text-right
+                        text-sm leading-relaxed break-words text-right text-black
                         [&_*]:text-right
                         [&_table]:w-full [&_table]:border-collapse
-                        [&_th]:border [&_th]:border-white/30 [&_th]:bg-white/10 [&_th]:px-3 [&_th]:py-2 [&_th]:text-right
-                        [&_td]:border [&_td]:border-white/30 [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_td]:text-right
-                        [&_tr:nth-child(even)]:bg-white/5
+                        [&_th]:border [&_th]:border-gray-300 [&_th]:bg-gray-100 [&_th]:px-3 [&_th]:py-2 [&_th]:text-right
+                        [&_td]:border [&_td]:border-gray-300 [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_td]:text-right
+                        [&_tr:nth-child(even)]:bg-gray-50
                         [&_p]:m-0 [&_p]:text-right
                         [&_ul]:my-2 [&_ul]:pr-5 [&_ul]:text-right
                         [&_ol]:my-2 [&_ol]:pr-5 [&_ol]:text-right
                         [&_li]:text-right
-                        [&_a]:text-white [&_a]:underline
-                        [&_strong]:text-white
-                        [&_code]:bg-white/10 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded
+                        [&_a]:text-gray-900 [&_a]:underline
+                        [&_strong]:text-black
+                        [&_code]:bg-gray-100 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded
                       "
                     >
                       <div className="overflow-x-auto">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {String(m.content || "")}
+                          {cleanAssistantContent(String(m.content || ""))}
                         </ReactMarkdown>
                       </div>
                     </div>
                   ) : (
-                    <p className="text-sm leading-relaxed break-words whitespace-pre-wrap">
+                    <p
+                      dir="rtl"
+                      className="text-sm leading-relaxed break-words whitespace-pre-wrap text-right"
+                    >
                       {m.content}
                     </p>
                   )}
@@ -293,8 +379,8 @@ export function ChatPage() {
                   {m.sender === "assistant" &&
                     Array.isArray(m.choices) &&
                     m.choices.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-white/20">
-                        <p className="text-xs font-semibold text-white/90 mb-2">
+                      <div className="mt-3 pt-3 border-t border-gray-200">
+                        <p className="text-xs font-semibold text-gray-700 mb-2">
                           اختر ملف:
                         </p>
 
@@ -305,7 +391,7 @@ export function ChatPage() {
                               type="button"
                               variant="outline"
                               className="justify-start rounded-xl border-white/30 bg-white text-gray-800 hover:bg-gray-100"
-                              disabled={choosing || sending}
+                              disabled={choosing || sending || streaming}
                               onClick={() => sendChoice(c.label, c.doc_key)}
                               title={c.label}
                             >
@@ -324,8 +410,8 @@ export function ChatPage() {
                   {m.sender === "assistant" &&
                     Array.isArray(m.attachments) &&
                     m.attachments.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-white/20 space-y-2">
-                        <p className="text-xs font-semibold text-white/90">
+                      <div className="mt-3 pt-3 border-t border-gray-200 space-y-2">
+                        <p className="text-xs font-semibold text-gray-700">
                           ملفات للتحميل
                         </p>
 
@@ -382,28 +468,33 @@ export function ChatPage() {
                   {m.sender === "assistant" &&
                     Array.isArray(m.sources) &&
                     m.sources.length > 0 && (
-                      <div className="mt-3 pt-3 border-t border-white/20">
-                        <p className="text-xs font-semibold text-white/90 mb-2">
+                      <div className="mt-3 pt-3 border-t border-gray-200">
+                        <p className="text-xs font-semibold text-gray-700 mb-2">
                           المصادر
                         </p>
                         <div className="flex flex-wrap gap-2">
                           {m.sources.map((s, idx) => (
-                            <span
+                            <button
                               key={`${m.id}-src-${idx}`}
-                              className="text-xs bg-white text-gray-700 border border-white/20 rounded-full px-2 py-1"
+                              type="button"
+                              className="inline-flex items-center gap-1 text-xs bg-white text-gray-700 border border-gray-300 rounded-full px-2 py-1 hover:bg-gray-50 transition-colors"
                               title={s.page ? `${s.name} — صفحة ${s.page}` : s.name}
+                              onClick={() => openSourcePreview(s)}
                             >
-                              {s.name}
+                              <Eye className="w-3 h-3" />
+                              <span>معاينة</span>
+                              <span className="text-gray-400">|</span>
+                              {formatSourceName(s.name)}
                               {s.page ? ` — صفحة ${s.page}` : ""}
-                            </span>
+                            </button>
                           ))}
                         </div>
                       </div>
                     )}
 
                   {m.sender === "assistant" && m.debug && (
-                    <div className="mt-3 pt-3 border-t border-white/20">
-                      <p className="text-xs font-semibold text-white/90 mb-2">
+                    <div className="mt-3 pt-3 border-t border-gray-200">
+                      <p className="text-xs font-semibold text-gray-700 mb-2">
                         Debug (RAG)
                       </p>
                       <pre className="text-xs bg-black/30 text-white p-3 rounded-lg overflow-x-auto whitespace-pre-wrap text-left dir-ltr">
@@ -414,6 +505,24 @@ export function ChatPage() {
                 </div>
               </div>
             ))}
+            {(sending || choosing || streaming) && (
+              <div className="flex justify-end">
+                <div className="inline-flex items-center gap-1 rounded-full bg-gray-100 border border-gray-200 px-3 py-2">
+                  <span
+                    className="w-2 h-2 rounded-full bg-gray-500 animate-bounce"
+                    style={{ animationDelay: "0ms" }}
+                  />
+                  <span
+                    className="w-2 h-2 rounded-full bg-gray-500 animate-bounce"
+                    style={{ animationDelay: "150ms" }}
+                  />
+                  <span
+                    className="w-2 h-2 rounded-full bg-gray-500 animate-bounce"
+                    style={{ animationDelay: "300ms" }}
+                  />
+                </div>
+              </div>
+            )}
             <div ref={messagesEndRef} />
           </div>
         )}
@@ -427,18 +536,32 @@ export function ChatPage() {
             onKeyDown={(e) => e.key === "Enter" && sendMessage(inputMessage)}
             placeholder="اكتب رسالتك هنا..."
             className="flex-1 rounded-xl border-gray-300 focus:border-[#2E7D32] focus:ring-[#2E7D32] h-11"
-            disabled={sending || choosing}
+            disabled={sending || choosing || streaming}
           />
           <Button
             onClick={() => sendMessage(inputMessage)}
-            className="bg-[#2E7D32] hover:bg-[#1B5E20] text-white rounded-xl px-6 h-11"
-            disabled={sending || choosing}
+            className="bg-[#2E7D32] hover:bg-[#1B5E20] text-white rounded-full w-11 h-11 p-0 flex items-center justify-center"
+            disabled={sending || choosing || streaming}
             title={choosing ? "اختر ملف أولاً" : "إرسال"}
           >
-            <Send className="h-5 w-5" />
+            <ArrowUp className="h-5 w-5" />
           </Button>
         </div>
       </div>
     </div>
+    <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+      <DialogContent className="w-[100vw] h-[100dvh] max-w-none rounded-none p-2 gap-2 sm:w-[98vw] sm:h-[94vh] sm:max-w-7xl sm:rounded-lg sm:p-4">
+        <div className="flex-1 min-h-0 w-full">
+          {previewSource ? (
+            <iframe
+              src={getSourcePreviewUrl(previewSource)}
+              title={formatSourceName(previewSource.name)}
+              className="w-full h-full border rounded-md sm:rounded-lg"
+            />
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+    </>
   );
 }

@@ -2,11 +2,14 @@ import os
 import re
 import inspect
 import asyncio
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
+from html import unescape
 
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+from langchain_text_splitters import HTMLHeaderTextSplitter
 
 
 class DocumentProcessor:
@@ -39,6 +42,19 @@ class DocumentProcessor:
 
         # Merge tiny chunks so RAG doesn't retrieve headings only
         self.min_chunk_chars = int(os.getenv("HTML_MIN_CHUNK_CHARS", "250"))
+
+        # Legal HTML: split chunks at h1/h2 only (full مادة including h3/p). LEGAL_SPLIT_ON_H3=1 restores old h3 boundaries.
+        self.legal_split_on_h3 = (os.getenv("LEGAL_SPLIT_ON_H3") or "0").strip() == "1"
+        # If one h2 section exceeds this (plain-text chars), split into parts with same headers (0 = disabled).
+        self.legal_h2_max_chars = int((os.getenv("LEGAL_H2_MAX_CHARS") or "0").strip() or "0")
+
+        # PDF_HTML_MODE=gemini_file: PDF→HTML via Gemini Files API + to_structured_html_from_pdf (no pypdf for HTML).
+        # Requires GEMINI_API_KEY or GOOGLE_API_KEY; optional GEMINI_MODEL_NAME, HTML_MAX_TOKENS.
+
+    def _trace(self, request_id: str, step: str, t0: float, extra: str = "") -> None:
+        elapsed = time.perf_counter() - t0
+        suffix = f" | {extra}" if extra else ""
+        print(f"[TRACE][DOC_PROCESS][{request_id}] {step} | +{elapsed:.2f}s{suffix}")
 
     # =========================================================
     # Helpers: clean stored filename -> original filename
@@ -260,57 +276,283 @@ class DocumentProcessor:
         return out
 
     # =========================================================
-    # ✅ Split BODY by H1/H2/H3 only
+    # Table normalization + strict legal split (H1/H2/H3)
     # =========================================================
-    def _split_html_by_h123(self, html_doc: str) -> List[str]:
+    _RE_TABLE = re.compile(r"(?is)<table\b[^>]*>.*?</table>")
+    _RE_TR = re.compile(r"(?is)<tr\b[^>]*>(.*?)</tr>")
+    _RE_CELL = re.compile(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>")
+    _RE_TAG = re.compile(r"(?is)<[^>]+>")
+    _RE_PAGE_ATTR = re.compile(r'(?is)data-page\s*=\s*"(\d+)"')
+
+    def _html_fragment_to_text(self, html_fragment: str) -> str:
+        t = (html_fragment or "").strip()
+        if not t:
+            return ""
+        t = re.sub(r"(?is)<br\s*/?>", "\n", t)
+        t = re.sub(r"(?is)</p\s*>", "\n\n", t)
+        t = re.sub(r"(?is)</h[1-6]\s*>", "\n", t)
+        t = re.sub(r"(?is)</li\s*>", "\n", t)
+        t = self._RE_TAG.sub(" ", t)
+        t = unescape(t)
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
+    def _normalize_table_to_text(self, table_html: str, table_id: str) -> Tuple[str, str]:
+        rows: List[List[str]] = []
+        for tr in self._RE_TR.findall(table_html or ""):
+            cells = [self._html_fragment_to_text(c) for c in self._RE_CELL.findall(tr or "")]
+            cells = [c for c in cells if c]
+            if cells:
+                rows.append(cells)
+
+        if not rows:
+            return "", ""
+
+        header = rows[0]
+        body = rows[1:] if len(rows) > 1 else []
+        schema = " | ".join(header)
+        row_texts: List[str] = []
+        for r in body:
+            cols: List[str] = []
+            max_len = min(len(header), len(r))
+            for i in range(max_len):
+                cols.append(f"{header[i]}={r[i]}")
+            if not cols and r:
+                cols = [f"col_{i+1}={val}" for i, val in enumerate(r)]
+            row_texts.append("[" + ", ".join(cols) + "]")
+
+        canonical = f"Table: {table_id}; schema: {schema}"
+        if row_texts:
+            canonical += " | " + " | ".join(row_texts)
+        return canonical.strip(), schema.strip()
+
+    def _normalize_html_tables(self, html_doc: str) -> Tuple[str, List[Dict[str, Any]]]:
         html_doc = (html_doc or "").strip()
         if not html_doc:
-            return []
+            return "", []
 
+        table_meta: List[Dict[str, Any]] = []
+
+        def _replace_table(match):
+            idx = len(table_meta) + 1
+            table_id = f"tbl_{idx}"
+            table_html = (match.group(0) or "").strip()
+            table_text, schema = self._normalize_table_to_text(table_html, table_id)
+            if not table_text:
+                return ""
+            table_meta.append(
+                {
+                    "table_id": table_id,
+                    "table_text": table_text,
+                    "table_schema": schema,
+                }
+            )
+            return f"<p>{table_text}</p>"
+
+        normalized = self._RE_TABLE.sub(_replace_table, html_doc)
+        return normalized, table_meta
+
+    def _section_type_from_headers(self, headers: Dict[str, str], body_text: str) -> str:
+        article = (headers.get("article") or "").strip()
+        if self._is_table_section(body_text):
+            return "table"
+        txt = (body_text or "").strip().lower()
+        if article:
+            return "article"
+        if (headers.get("level_2") or "").strip():
+            return "h2_section"
+        if (headers.get("level_1") or "").strip():
+            return "chapter"
+        return "body"
+
+    def _looks_like_table_text(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        tl = t.lower()
+        if "table:" in tl:
+            return True
+        # Markdown table signature: has pipes and a separator row.
+        if "|" in t and re.search(r"^\s*\|?\s*[-:]{3,}", t, flags=re.MULTILINE):
+            return True
+        return False
+
+    def _is_table_section(self, text: str) -> bool:
+        """
+        Conservative detector:
+        mark as table only when the section is table-only/predominantly table.
+        This avoids classifying full h2/article sections as table just because they
+        contain one embedded table line.
+        """
+        t = (text or "").strip()
+        if not t:
+            return False
+
+        # Canonical table blocks generated by _normalize_html_tables are single-line-like.
+        if t.lower().startswith("table:"):
+            return True
+
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        if not lines:
+            return False
+
+        tableish = 0
+        non_tableish = 0
+        for ln in lines:
+            lnl = ln.lower()
+            if "table:" in lnl:
+                tableish += 1
+                continue
+            if "|" in ln and re.search(r"^\s*\|?\s*[-:]{3,}", ln):
+                tableish += 1
+                continue
+            non_tableish += 1
+
+        # Consider it a table section only when almost everything is table-like.
+        return tableish > 0 and non_tableish == 0
+
+    _RE_FIRST_H3 = re.compile(r"(?is)<h3\b[^>]*>(.*?)</h3\s*>")
+
+    def _derive_first_h3_plain(self, section_html: str) -> str:
+        m = self._RE_FIRST_H3.search(section_html or "")
+        if not m:
+            return ""
+        return self._html_to_plain(m.group(1)).strip()
+
+    def _split_plain_into_parts(self, text: str, max_chars: int) -> List[str]:
+        """Split plain text at paragraph boundaries; each part at most max_chars (fallback hard cut)."""
+        t = (text or "").strip()
+        if not t or max_chars <= 0:
+            return [t] if t else []
+        paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
+        if not paras:
+            return [t[:max_chars]]
+        parts: List[str] = []
+        buf: List[str] = []
+        cur_len = 0
+        for p in paras:
+            add_len = len(p) if not buf else len(p) + 2
+            if buf and cur_len + add_len > max_chars:
+                parts.append("\n\n".join(buf))
+                buf = [p]
+                cur_len = len(p)
+                continue
+            buf.append(p)
+            cur_len += add_len
+        if buf:
+            parts.append("\n\n".join(buf))
+        # Handle single huge paragraph
+        out: List[str] = []
+        for chunk in parts:
+            if len(chunk) <= max_chars:
+                out.append(chunk)
+                continue
+            i = 0
+            while i < len(chunk):
+                out.append(chunk[i : i + max_chars])
+                i += max_chars
+        return [x for x in out if x.strip()]
+
+    def _merge_leading_tiny_h2_parts(self, parts: List[str]) -> List[str]:
+        """
+        After LEGAL_H2_MAX_CHARS splitting, the first paragraph (often only the h2 title line)
+        can become its own tiny chunk; merge it into the next part so retrieval does not surface
+        a useless heading-only hit.
+        """
+        if not parts or len(parts) < 2:
+            return parts
+        min_c = max(100, int(self.min_chunk_chars))
+        merged = [p for p in parts if (p or "").strip()]
+        safety = 0
+        while len(merged) >= 2 and len(merged[0].strip()) < min_c and safety < len(parts) + 5:
+            a = merged[0].strip()
+            b = merged[1].strip()
+            merged = [a + "\n\n" + b] + merged[2:]
+            safety += 1
+        return merged
+
+    def _expand_oversized_h2_sections(self, sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        max_c = self.legal_h2_max_chars
+        if max_c <= 0:
+            return sections
+        expanded: List[Dict[str, Any]] = []
+        for sec in sections:
+            text = (sec.get("text") or "").strip()
+            html = (sec.get("html") or "").strip()
+            headers = dict(sec.get("headers") or {})
+            if len(text) <= max_c:
+                expanded.append(sec)
+                continue
+            parts = self._split_plain_into_parts(text, max_c)
+            parts = self._merge_leading_tiny_h2_parts(parts)
+            total = len(parts)
+            for pi, part in enumerate(parts):
+                h = dict(headers)
+                if total > 1:
+                    h["h2_part_index"] = str(pi + 1)
+                    h["h2_part_total"] = str(total)
+                expanded.append(
+                    {
+                        "html": html,
+                        "text": part.strip(),
+                        "headers": h,
+                    }
+                )
+        return expanded
+
+    def _strict_split_legal_sections(self, html_doc: str) -> List[Dict[str, Any]]:
         body = self._strip_outer_html(html_doc)
         if not body:
             return []
 
-        split_pat = re.compile(r"(?is)(<h[1-3]\b[^>]*>.*?</h[1-3]\s*>)")
-        parts = split_pat.split(body)
+        headers_to_split: List[Tuple[str, str]] = [
+            ("h1", "level_1"),
+            ("h2", "level_2"),
+        ]
+        if self.legal_split_on_h3:
+            headers_to_split.append(("h3", "article"))
 
-        blocks: List[str] = []
-        if len(parts) == 1:
-            return [body.strip()] if body.strip() else []
+        splitter = HTMLHeaderTextSplitter(headers_to_split_on=headers_to_split)
+        docs = splitter.split_text(body)
 
-        before = (parts[0] or "").strip()
-        if before:
-            blocks.append(before)
-
-        i = 1
-        while i < len(parts) - 1:
-            h = (parts[i] or "").strip()
-            b = (parts[i + 1] or "").strip()
-            block = (h + "\n" + b).strip()
-            if block:
-                blocks.append(block)
-            i += 2
-
-        return self._merge_tiny_text_chunks(blocks)
-
-    def _merge_tiny_text_chunks(self, chunks: List[str]) -> List[str]:
-        merged: List[str] = []
-        buf = ""
-        for c in chunks:
-            c = (c or "").strip()
-            if not c:
+        out: List[Dict[str, Any]] = []
+        for d in docs:
+            md = d.metadata or {}
+            section_html = (d.page_content or "").strip()
+            if not section_html:
                 continue
-            if not buf:
-                buf = c
-                continue
-            if len(buf) < self.min_chunk_chars:
-                buf = (buf + "\n\n" + c).strip()
-                continue
-            merged.append(buf)
-            buf = c
-        if buf:
-            merged.append(buf)
-        return [m for m in merged if (m or "").strip()]
+            level_1 = str(md.get("level_1") or "").strip()
+            level_2 = str(md.get("level_2") or "").strip()
+            article = str(md.get("article") or "").strip()
+            if not self.legal_split_on_h3 and not article:
+                article = self._derive_first_h3_plain(section_html)
+            header_parts = [x for x in [level_1, level_2, article] if x]
+            header_path = " > ".join(header_parts)
+            section_text = self._html_to_plain(section_html)
+            out.append(
+                {
+                    "html": section_html,
+                    "text": section_text,
+                    "headers": {
+                        "level_1": level_1,
+                        "level_2": level_2,
+                        "article": article,
+                        "header_path": header_path,
+                    },
+                }
+            )
+
+        return self._expand_oversized_h2_sections(out)
+
+    def _extract_page_from_unit_html(self, unit_html: str) -> Any:
+        m = self._RE_PAGE_ATTR.search(unit_html or "")
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
 
     # =========================================================
     # Delete old indexed chunks for the same doc_key
@@ -346,31 +588,50 @@ class DocumentProcessor:
     # =========================================================
     async def process_file(self, file_path: str) -> Dict[str, Any]:
         file_ext = os.path.splitext(file_path)[1].lower()
+        request_id = f"{int(time.time() * 1000)}-{os.path.basename(file_path)[:24]}"
+        t0 = time.perf_counter()
+        self._trace(request_id, "start", t0, f"file_ext={file_ext} path={file_path}")
 
         try:
             content = ""
             tables_md: List[str] = []
             pdf_pages: List[Dict[str, Any]] = []
 
+            # PDF_HTML_MODE=gemini_file: skip pypdf extraction; HTML comes from Gemini + PDF attachment
+            pdf_gemini_file = file_ext == ".pdf" and (
+                (os.getenv("PDF_HTML_MODE") or "").strip().lower() == "gemini_file"
+            )
+
             if file_ext in [".png", ".jpg", ".jpeg"]:
                 content = self._process_image(file_path)
             elif file_ext == ".pdf":
-                pdf_pages = self._process_pdf_pages(file_path)
-                content = "\n\n".join(
-                    p["text"] for p in pdf_pages if (p.get("text") or "").strip()
-                ).strip()
+                if pdf_gemini_file:
+                    pdf_pages = []
+                    content = ""
+                else:
+                    pdf_pages = self._process_pdf_pages(file_path)
+                    content = "\n\n".join(
+                        p["text"] for p in pdf_pages if (p.get("text") or "").strip()
+                    ).strip()
             elif file_ext in [".docx", ".doc"]:
                 content, tables_md = self._process_docx_with_tables(file_path)
             elif file_ext == ".txt":
                 content = self._process_txt(file_path)
             else:
                 raise ValueError(f"نوع الملف {file_ext} غير مدعوم")
+            self._trace(
+                request_id,
+                "content_extracted",
+                t0,
+                f"content_chars={len(content)} tables={len(tables_md)} pdf_pages={len(pdf_pages)}",
+            )
 
             content = (content or "").strip()
             tables_md = [t.strip() for t in (tables_md or []) if (t or "").strip()]
 
-            if not content and not tables_md:
+            if not content and not tables_md and not pdf_gemini_file:
                 print("⚠️ الملف فارغ بعد المعالجة")
+                self._trace(request_id, "stop_empty_content", t0)
                 return {"html": "", "converted_txt_path": "", "converted_name": ""}
 
             stored_filename = os.path.basename(file_path)
@@ -401,7 +662,15 @@ class DocumentProcessor:
 
             raw_text_for_llm = "\n\n".join(combined_parts).strip()
 
-            if not self.llm_service or not hasattr(self.llm_service, "to_structured_html"):
+            if not self.llm_service:
+                raise RuntimeError("llm_service غير متوفر.")
+            if pdf_gemini_file:
+                if not hasattr(self.llm_service, "to_structured_html_from_pdf"):
+                    raise RuntimeError(
+                        "llm_service.to_structured_html_from_pdf() غير متوفر. "
+                        "تأكد من تعديل llm_service.py وتمريره هنا."
+                    )
+            elif not hasattr(self.llm_service, "to_structured_html"):
                 raise RuntimeError(
                     "llm_service.to_structured_html() غير متوفر. "
                     "تأكد من تعديل llm_service.py وتمريره هنا."
@@ -416,46 +685,84 @@ class DocumentProcessor:
             # =========================================================
             html_units: List[Dict[str, Any]] = []
 
-            if file_ext == ".pdf" and pdf_pages:
+            if file_ext == ".pdf" and pdf_gemini_file:
+                pdf_timeout = max(self.html_llm_timeout, 180)
                 print(
-                    f"🧩 HTML convert pdf pages={len(pdf_pages)} timeout={self.html_llm_timeout}s"
+                    f"🧩 HTML convert pdf (Gemini file API) timeout={pdf_timeout}s path={file_path}"
+                )
+                self._trace(
+                    request_id,
+                    "html_convert_pdf_gemini_file_start",
+                    t0,
+                    f"timeout={pdf_timeout}s",
                 )
 
-                for page_item in pdf_pages:
-                    page_text = (page_item.get("text") or "").strip()
-                    page_number = page_item.get("page_number")
+                out = ""
+                try:
+                    out = await asyncio.wait_for(
+                        self._maybe_await(
+                            self.llm_service.to_structured_html_from_pdf(file_path, save_name)
+                        ),
+                        timeout=pdf_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"⏱️ PDF Gemini-file conversion timed out after {pdf_timeout}s")
 
-                    if not page_text:
-                        continue
+                inner = self._strip_outer_html(out or "")
+                if inner:
+                    html_units.append({
+                        "page_number": None,
+                        "page_text": "",
+                        "html": inner,
+                    })
+                self._trace(
+                    request_id,
+                    "html_convert_pdf_gemini_file_done",
+                    t0,
+                    f"html_units={len(html_units)}",
+                )
 
-                    if len(page_text) > self.html_hard_max_chars:
-                        page_text = page_text[: self.html_hard_max_chars]
+            elif file_ext == ".pdf" and pdf_pages:
+                pdf_full_text = "\n\n".join(
+                    f"[PAGE {int(p.get('page_number') or 0)}]\n{(p.get('text') or '').strip()}"
+                    for p in pdf_pages
+                    if (p.get("text") or "").strip()
+                ).strip()
+                if not pdf_full_text:
+                    pdf_full_text = raw_text_for_llm
 
-                    print(f"🚀 PDF page {page_number}/{len(pdf_pages)} chars={len(page_text)}")
+                if len(pdf_full_text) > self.html_hard_max_chars:
+                    pdf_full_text = pdf_full_text[: self.html_hard_max_chars]
+                    print(f"✂️ Truncated PDF text to {len(pdf_full_text)} chars (HTML_HARD_MAX_CHARS)")
 
-                    try:
-                        out = await asyncio.wait_for(
-                            self._maybe_await(self.llm_service.to_structured_html(page_text)),
-                            timeout=self.html_llm_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        print(f"⏱️ PDF page {page_number} timed out")
-                        continue
+                pdf_timeout = max(self.html_llm_timeout, 180)
+                print(
+                    f"🧩 HTML convert pdf (single pass) pages={len(pdf_pages)} chars={len(pdf_full_text)} timeout={pdf_timeout}s"
+                )
+                self._trace(
+                    request_id,
+                    "html_convert_pdf_single_start",
+                    t0,
+                    f"pages={len(pdf_pages)} chars={len(pdf_full_text)} timeout={pdf_timeout}",
+                )
 
-                    inner = self._strip_outer_html(out or "")
-                    if inner and page_number is not None:
-                        inner = (
-                            f'<div class="page-block" data-page="{int(page_number)}">\n'
-                            f'{inner}\n'
-                            f"</div>"
-                        )
+                out = ""
+                try:
+                    out = await asyncio.wait_for(
+                        self._maybe_await(self.llm_service.to_structured_html(pdf_full_text)),
+                        timeout=pdf_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"⏱️ PDF single-pass conversion timed out after {pdf_timeout}s")
 
-                    if inner:
-                        html_units.append({
-                            "page_number": page_number,
-                            "page_text": page_text,
-                            "html": inner,
-                        })
+                inner = self._strip_outer_html(out or "")
+                if inner:
+                    html_units.append({
+                        "page_number": None,
+                        "page_text": pdf_full_text,
+                        "html": inner,
+                    })
+                self._trace(request_id, "html_convert_pdf_single_done", t0, f"html_units={len(html_units)}")
 
             else:
                 if len(raw_text_for_llm) > self.html_hard_max_chars:
@@ -466,6 +773,7 @@ class DocumentProcessor:
                 print(
                     f"🧩 HTML convert segments={len(segments)} total_chars={len(raw_text_for_llm)} timeout={self.html_llm_timeout}s"
                 )
+                self._trace(request_id, "html_convert_segments_start", t0, f"segments={len(segments)}")
 
                 for si, seg in enumerate(segments, start=1):
                     seg = (seg or "").strip()
@@ -490,6 +798,7 @@ class DocumentProcessor:
                             "page_text": seg,
                             "html": inner,
                         })
+                self._trace(request_id, "html_convert_segments_done", t0, f"html_units={len(html_units)}")
 
             body_inner_all = "\n\n".join(
                 (u.get("html") or "").strip()
@@ -499,60 +808,109 @@ class DocumentProcessor:
 
             if not body_inner_all:
                 print("⚠️ LLM رجّع HTML فارغ")
+                self._trace(request_id, "stop_empty_html", t0, "html_units=0")
                 return {"html": "", "converted_txt_path": "", "converted_name": ""}
 
             html = self._wrap_html_document(body_inner_all, title=save_name)
             converted_txt_path, converted_name = self._save_converted_html_as_txt(save_name, html)
+            self._trace(request_id, "html_saved", t0, f"converted_name={converted_name}")
 
             # =========================================================
-            # Prepare chunks for indexing
-            # PDF: each page html = chunk with page_number + page_content
-            # Others: split by H1/H2/H3, no page number
+            # Prepare chunks for indexing (strict legal hierarchy)
             # =========================================================
             chunks_to_index: List[Dict[str, Any]] = []
+            table_seq = 0
+            for unit in html_units:
+                unit_html = (unit.get("html") or "").strip()
+                if not unit_html:
+                    continue
 
-            if file_ext == ".pdf" and html_units:
-                for unit in html_units:
-                    chunk_html = (unit.get("html") or "").strip()
-                    if not chunk_html:
+                page_number = unit.get("page_number")
+                if page_number is None:
+                    page_number = self._extract_page_from_unit_html(unit_html)
+                page_content = (unit.get("page_text") or "").strip()
+
+                normalized_html, table_catalog = self._normalize_html_tables(unit_html)
+                sections = self._strict_split_legal_sections(normalized_html)
+                if not sections:
+                    sections = [
+                        {
+                            "html": normalized_html,
+                            "text": self._html_to_plain(normalized_html),
+                            "headers": {
+                                "level_1": "",
+                                "level_2": "",
+                                "article": "",
+                                "header_path": "",
+                            },
+                        }
+                    ]
+
+                for sec in sections:
+                    sec_text = (sec.get("text") or "").strip()
+                    if not sec_text:
                         continue
 
-                    chunks_to_index.append({
-                        "html": chunk_html,
-                        "page_number": unit.get("page_number"),
-                        "page_content": (unit.get("page_text") or "").strip(),
-                    })
-                print(f"🧩 PDF chunks produced: {len(chunks_to_index)}")
-            else:
-                chunks_html = self._split_html_by_h123(html)
-                print(f"🧩 HTML chunks produced: {len(chunks_html)}")
+                    headers = sec.get("headers") or {}
+                    section_type = self._section_type_from_headers(headers, sec_text)
+                    level_1 = str(headers.get("level_1") or "").strip()
+                    level_2 = str(headers.get("level_2") or "").strip()
+                    article = str(headers.get("article") or "").strip()
 
-                for chunk_html in chunks_html:
-                    chunk_html = (chunk_html or "").strip()
-                    if not chunk_html:
+                    # Skip heading-only chunks (e.g. an h2 title indexed alone without body text).
+                    # This avoids retrieving tiny title chunks such as "المادة الخامسة والثلاثون".
+                    text_norm = re.sub(r"\s+", " ", sec_text).strip()
+                    heading_candidates = {
+                        re.sub(r"\s+", " ", x).strip()
+                        for x in [level_1, level_2, article]
+                        if x and re.sub(r"\s+", " ", x).strip()
+                    }
+                    if heading_candidates and text_norm in heading_candidates:
                         continue
 
-                    chunk_plain_tmp = self._html_to_plain(chunk_html)
+                    is_table = self._is_table_section(sec_text)
+                    table_meta = {}
+                    if is_table and table_catalog:
+                        table_seq += 1
+                        table_meta = table_catalog[min(table_seq - 1, len(table_catalog) - 1)]
 
-                    chunks_to_index.append({
-                        "html": chunk_html,
-                        "page_number": None,
-                        "page_content": chunk_plain_tmp[:2000] if chunk_plain_tmp else "",
-                    })
+                    chunks_to_index.append(
+                        {
+                            "html": (sec.get("html") or "").strip(),
+                            "text": sec_text,
+                            "page_number": page_number,
+                            "page_content": page_content[:4000] if page_content else "",
+                            "level_1": level_1,
+                            "level_2": level_2,
+                            "article": article,
+                            "header_path": str(headers.get("header_path") or "").strip(),
+                            "h2_part_index": str(headers.get("h2_part_index") or "").strip(),
+                            "h2_part_total": str(headers.get("h2_part_total") or "").strip(),
+                            "section_type": section_type,
+                            "is_table": bool(is_table),
+                            "table_id": str(table_meta.get("table_id") or ""),
+                            "table_text": str(table_meta.get("table_text") or ""),
+                            "table_schema": str(table_meta.get("table_schema") or ""),
+                            "parent_header_path": str(headers.get("header_path") or "").strip(),
+                        }
+                    )
+
+            print(f"🧩 Legal chunks produced: {len(chunks_to_index)}")
+            self._trace(request_id, "legal_chunks_built", t0, f"chunks={len(chunks_to_index)}")
 
             if not chunks_to_index:
+                self._trace(request_id, "done_no_chunks", t0)
                 return {"html": html, "converted_txt_path": converted_txt_path, "converted_name": converted_name}
 
             self._delete_existing_index(doc_key)
+            self._trace(request_id, "old_index_deleted", t0, f"doc_key={doc_key}")
 
             if self.rag_system:
+                indexed_count = 0
                 for idx, item in enumerate(chunks_to_index, start=0):
                     chunk_html = (item.get("html") or "").strip()
-                    if not chunk_html:
-                        continue
-
-                    chunk_plain = self._html_to_plain(chunk_html)
-                    if not chunk_plain:
+                    chunk_plain = (item.get("text") or "").strip()
+                    if not chunk_html or not chunk_plain:
                         continue
 
                     chunk_id = f"{document_id}::chunk_{idx}"
@@ -562,6 +920,23 @@ class DocumentProcessor:
                     chunk_meta["skip_chunking"] = True
                     chunk_meta["chunk_index"] = int(idx)
                     chunk_meta["html"] = chunk_html
+                    chunk_meta["chunk_type"] = "legal_section"
+                    chunk_meta["level_1"] = item.get("level_1") or ""
+                    chunk_meta["level_2"] = item.get("level_2") or ""
+                    chunk_meta["article"] = item.get("article") or ""
+                    chunk_meta["h2"] = item.get("level_2") or ""
+                    chunk_meta["h3"] = item.get("article") or ""
+                    chunk_meta["header_path"] = item.get("header_path") or ""
+                    chunk_meta["parent_header_path"] = item.get("parent_header_path") or ""
+                    chunk_meta["section_type"] = item.get("section_type") or "body"
+                    chunk_meta["is_table"] = bool(item.get("is_table"))
+                    chunk_meta["table_id"] = item.get("table_id") or ""
+                    chunk_meta["table_text"] = item.get("table_text") or ""
+                    chunk_meta["table_schema"] = item.get("table_schema") or ""
+                    if item.get("h2_part_index"):
+                        chunk_meta["h2_part_index"] = item.get("h2_part_index") or ""
+                    if item.get("h2_part_total"):
+                        chunk_meta["h2_part_total"] = item.get("h2_part_total") or ""
 
                     page_number = item.get("page_number")
                     page_content = (item.get("page_content") or "").strip()
@@ -572,16 +947,47 @@ class DocumentProcessor:
                     if page_content:
                         chunk_meta["page_content"] = page_content[:4000]
 
+                    # Enrich ingested chunk text with document title + h2/h3 context.
+                    title = str(
+                        chunk_meta.get("original_name")
+                        or chunk_meta.get("filename")
+                        or chunk_meta.get("name")
+                        or ""
+                    ).strip()
+                    h2_title = str(item.get("level_2") or "").strip()
+                    article_h3 = str(item.get("article") or "").strip()
+                    chunk_plain_norm = re.sub(r"\s+", " ", chunk_plain).strip()
+                    ingest_parts: List[str] = []
+                    if title:
+                        ingest_parts.append(f"عنوان المستند: {title}")
+                    # Keep h2 in indexed text so semantic retrieval can match article/chapter titles directly.
+                    if h2_title:
+                        h2_norm = re.sub(r"\s+", " ", h2_title).strip()
+                        if h2_norm and h2_norm not in chunk_plain_norm:
+                            ingest_parts.append(f"العنوان (h2): {h2_title}")
+                    if article_h3:
+                        h3_norm = re.sub(r"\s+", " ", article_h3).strip()
+                        if h3_norm and h3_norm not in chunk_plain_norm:
+                            ingest_parts.append(f"العنوان الفرعي (h3): {article_h3}")
+                    ingest_parts.append(chunk_plain)
+                    ingest_text = "\n".join(ingest_parts).strip()
+
                     self.rag_system.add_document(
-                        content=chunk_plain,
+                        content=ingest_text,
                         metadata=chunk_meta,
                         document_id=chunk_id,
                     )
+                    indexed_count += 1
+                self._trace(request_id, "indexing_done", t0, f"indexed_chunks={indexed_count}")
+            else:
+                self._trace(request_id, "indexing_skipped_no_rag_system", t0)
 
+            self._trace(request_id, "done", t0)
             return {"html": html, "converted_txt_path": converted_txt_path, "converted_name": converted_name}
 
         except Exception as e:
             print(f"❌ DocumentProcessor error: {e}")
+            self._trace(request_id, "error", t0, f"error={e}")
             raise
 
     # =========================================================
@@ -675,31 +1081,6 @@ class DocumentProcessor:
                 })
 
         return pages
-
-    def _process_pdf(self, file_path: str) -> str:
-        reader = PdfReader(file_path)
-        text_parts: List[str] = []
-
-        for page in reader.pages:
-            extracted = page.extract_text() or ""
-            if extracted.strip():
-                text_parts.append(extracted)
-
-        text = "\n\n".join(text_parts).strip()
-        if self.enable_ocr and len(text.strip()) < 20:
-            ocr = self._try_import_ocr()
-            if ocr:
-                pytesseract, _Image, convert_from_path = ocr
-                try:
-                    images = convert_from_path(file_path)
-                    ocr_parts: List[str] = []
-                    for img in images:
-                        ocr_parts.append(pytesseract.image_to_string(img, lang="ara+eng"))
-                    text = "\n\n".join(ocr_parts).strip()
-                except Exception as e:
-                    print("⚠️ PDF OCR failed:", e)
-
-        return self._clean_text_keep_tables(text)
 
     def _process_docx_with_tables(self, file_path: str) -> Tuple[str, List[str]]:
         doc = DocxDocument(file_path)

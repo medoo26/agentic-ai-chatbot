@@ -29,9 +29,9 @@ wheels/
 *.sqlite3
 
 # Environment
-.env
-.env.local
 
+.env.local
+.venv
 # Vector Store
 vector_store/
 

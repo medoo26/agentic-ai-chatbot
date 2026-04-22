@@ -71,9 +71,6 @@ class DocumentChunk(Base):
     document = relationship("Document", back_populates="chunks")
 
 
-Index("ix_document_chunks_document_id", DocumentChunk.document_id)
-
-
 class KnowledgeEntry(Base):
     __tablename__ = "knowledge_entries"
 
