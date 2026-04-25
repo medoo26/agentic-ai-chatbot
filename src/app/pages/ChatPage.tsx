@@ -296,7 +296,7 @@ export function ChatPage() {
             <Button
               onClick={createNewChat}
               variant="outline"
-              className="h-11 px-4 border-[#2E7D32] text-[#2E7D32] hover:bg-[#E8F5E9] rounded-xl"
+              className="h-11 px-4 border-gray-300 text-black hover:bg-gray-100 rounded-xl"
               title="محادثة جديدة"
             >
               <Plus className="w-4 h-4 ml-2" />
@@ -305,7 +305,7 @@ export function ChatPage() {
           </div>
 
           <div className="flex items-center gap-2 min-w-0">
-            <Bot className="w-6 h-6 text-[#2E7D32] flex-shrink-0" />
+            <Bot className="w-6 h-6 text-black flex-shrink-0" />
             <div className="min-w-0">
               <div className="font-semibold text-gray-800 truncate">
                 المساعد الذكي
